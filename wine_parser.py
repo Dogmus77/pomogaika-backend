@@ -161,18 +161,45 @@ class ConsumParser:
                 product_data = product_data[0] if product_data else {}
             
             name = product_data.get("name", "") if isinstance(product_data, dict) else ""
-            brand = product_data.get("brand", "") if isinstance(product_data, dict) else ""
+            # Name could also be a dict in some cases
+            if isinstance(name, dict):
+                name = name.get("name", name.get("value", str(name)))
+            name = str(name) if name else ""
+            
+            brand_data = product_data.get("brand", "") if isinstance(product_data, dict) else ""
+            
+            # Brand can be string or dict with 'name' key
+            if isinstance(brand_data, dict):
+                brand = brand_data.get("name", brand_data.get("id", ""))
+            else:
+                brand = str(brand_data) if brand_data else ""
             
             # Fallback: try direct fields if productData is empty
             if not name:
-                name = item.get("name", item.get("displayName", item.get("title", "")))
+                fallback_name = item.get("name", item.get("displayName", item.get("title", "")))
+                if isinstance(fallback_name, dict):
+                    name = fallback_name.get("name", fallback_name.get("value", ""))
+                else:
+                    name = str(fallback_name) if fallback_name else ""
             if not brand:
-                brand = item.get("brand", item.get("manufacturer", ""))
+                fallback_brand = item.get("brand", item.get("manufacturer", ""))
+                if isinstance(fallback_brand, dict):
+                    brand = fallback_brand.get("name", fallback_brand.get("id", ""))
+                else:
+                    brand = str(fallback_brand) if fallback_brand else ""
             
             # EAN код
             ean = product_data.get("ean", "") if isinstance(product_data, dict) else ""
+            if isinstance(ean, dict):
+                ean = ean.get("value", ean.get("code", ""))
+            ean = str(ean) if ean else ""
+            
             if not ean:
-                ean = item.get("ean", item.get("gtin", ""))
+                fallback_ean = item.get("ean", item.get("gtin", ""))
+                if isinstance(fallback_ean, dict):
+                    ean = fallback_ean.get("value", fallback_ean.get("code", ""))
+                else:
+                    ean = str(fallback_ean) if fallback_ean else ""
             
             # Цены - handle different structures
             price_data = item.get("priceData", {})
@@ -238,16 +265,32 @@ class ConsumParser:
             
             # URL и изображение
             slug = product_data.get("slug", "") if isinstance(product_data, dict) else ""
+            if isinstance(slug, dict):
+                slug = slug.get("value", slug.get("url", ""))
+            slug = str(slug) if slug else ""
+            
             if not slug:
-                slug = item.get("slug", item.get("url", ""))
+                fallback_slug = item.get("slug", item.get("url", ""))
+                if isinstance(fallback_slug, dict):
+                    slug = fallback_slug.get("value", "")
+                else:
+                    slug = str(fallback_slug) if fallback_slug else ""
             
             url = f"https://tienda.consum.es/es/p/{slug}/{product_id}" if slug else f"https://tienda.consum.es/es/p/{product_id}"
             
             image_url = ""
             if isinstance(product_data, dict):
-                image_url = product_data.get("imageURL", product_data.get("image", ""))
+                img = product_data.get("imageURL", product_data.get("image", ""))
+                if isinstance(img, dict):
+                    image_url = img.get("url", img.get("src", ""))
+                else:
+                    image_url = str(img) if img else ""
             if not image_url:
-                image_url = item.get("imageURL", item.get("image", item.get("thumbnail", "")))
+                fallback_img = item.get("imageURL", item.get("image", item.get("thumbnail", "")))
+                if isinstance(fallback_img, dict):
+                    image_url = fallback_img.get("url", fallback_img.get("src", ""))
+                else:
+                    image_url = str(fallback_img) if fallback_img else ""
             
             # Определение региона из названия
             region = self._extract_region(name)
