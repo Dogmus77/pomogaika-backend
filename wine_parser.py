@@ -62,64 +62,21 @@ class ConsumParser:
         """Поиск вин по типу"""
         query = f"vino {wine_type.value}"
         
-        # New Consum API endpoint (changed from /catalog/product)
-        url = f"{self.BASE_URL}/catalog/searcher/products"
+        url = f"{self.BASE_URL}/catalog/product"
         params = {
             "q": query,
             "limit": limit,
-            "showRecommendations": "false",
-            "showProducts": "true",
-            "showRecipes": "false"
+            "page": 1,
+            "showRecommendations": "false"
         }
         
         try:
-            response = self.session.get(url, params=params, timeout=15)
+            response = self.session.get(url, params=params)
             response.raise_for_status()
             data = response.json()
             
-            # Debug: print response structure
-            print(f"Consum API response keys: {data.keys() if isinstance(data, dict) else type(data)}")
-            
-            # Check what's inside catalog
-            if isinstance(data, dict) and "catalog" in data:
-                catalog = data["catalog"]
-                print(f"Consum catalog type: {type(catalog)}, length: {len(catalog) if hasattr(catalog, '__len__') else 'N/A'}")
-                if isinstance(catalog, dict):
-                    print(f"Consum catalog keys: {catalog.keys()}")
-                elif isinstance(catalog, list) and len(catalog) > 0:
-                    print(f"Consum first item keys: {catalog[0].keys() if isinstance(catalog[0], dict) else type(catalog[0])}")
-            
             wines = []
-            
-            # Try different response structures
-            products = []
-            if isinstance(data, dict):
-                # New structure: catalog is a dict with 'products' key inside
-                catalog = data.get("catalog", {})
-                
-                if isinstance(catalog, dict):
-                    # Products are inside catalog['products']
-                    products = catalog.get("products", [])
-                    print(f"Consum: got {len(products)} products from catalog.products")
-                elif isinstance(catalog, list):
-                    products = catalog
-                
-                # Fallback to other keys
-                if not products:
-                    products = data.get("products", data.get("results", data.get("items", [])))
-                    
-            elif isinstance(data, list):
-                products = data
-            
-            print(f"Consum found {len(products)} raw products")
-            
-            # Debug first product structure
-            if products and len(products) > 0:
-                first = products[0]
-                if isinstance(first, dict):
-                    print(f"Consum first product keys: {list(first.keys())[:10]}")
-            
-            for item in products:
+            for item in data.get("products", []):
                 wine = self._parse_product(item)
                 if wine:
                     wines.append(wine)
@@ -129,168 +86,37 @@ class ConsumParser:
         except requests.RequestException as e:
             print(f"Consum API error: {e}")
             return []
-        except Exception as e:
-            print(f"Consum parsing error: {e}")
-            return []
-    
-    def _safe_get(self, data, key, default=None):
-        """Safely get value from dict or list"""
-        if isinstance(data, dict):
-            return data.get(key, default)
-        elif isinstance(data, list) and len(data) > 0:
-            # If it's a list, try to get from first element
-            if isinstance(data[0], dict):
-                return data[0].get(key, default)
-        return default
     
     def _parse_product(self, item: dict) -> Optional[Wine]:
         """Парсинг продукта в объект Wine"""
         try:
-            # Handle both old and new API structures
-            if isinstance(item, list):
-                if len(item) == 0:
-                    return None
-                item = item[0] if isinstance(item[0], dict) else {"id": str(item[0])}
-            
             # Базовые данные
             product_id = str(item.get("id", ""))
+            name = item.get("productData", {}).get("name", "")
+            brand = item.get("productData", {}).get("brand", "")
             
-            # productData can be dict or list
-            product_data = item.get("productData", {})
-            if isinstance(product_data, list):
-                product_data = product_data[0] if product_data else {}
+            # EAN код (уникально для Consum!)
+            ean = item.get("productData", {}).get("ean", "")
             
-            name = product_data.get("name", "") if isinstance(product_data, dict) else ""
-            # Name could also be a dict in some cases
-            if isinstance(name, dict):
-                name = name.get("name", name.get("value", str(name)))
-            name = str(name) if name else ""
-            
-            brand_data = product_data.get("brand", "") if isinstance(product_data, dict) else ""
-            
-            # Brand can be string or dict with 'name' key
-            if isinstance(brand_data, dict):
-                brand = brand_data.get("name", brand_data.get("id", ""))
-            else:
-                brand = str(brand_data) if brand_data else ""
-            
-            # Fallback: try direct fields if productData is empty
-            if not name:
-                fallback_name = item.get("name", item.get("displayName", item.get("title", "")))
-                if isinstance(fallback_name, dict):
-                    name = fallback_name.get("name", fallback_name.get("value", ""))
-                else:
-                    name = str(fallback_name) if fallback_name else ""
-            if not brand:
-                fallback_brand = item.get("brand", item.get("manufacturer", ""))
-                if isinstance(fallback_brand, dict):
-                    brand = fallback_brand.get("name", fallback_brand.get("id", ""))
-                else:
-                    brand = str(fallback_brand) if fallback_brand else ""
-            
-            # EAN код
-            ean = product_data.get("ean", "") if isinstance(product_data, dict) else ""
-            if isinstance(ean, dict):
-                ean = ean.get("value", ean.get("code", ""))
-            ean = str(ean) if ean else ""
-            
-            if not ean:
-                fallback_ean = item.get("ean", item.get("gtin", ""))
-                if isinstance(fallback_ean, dict):
-                    ean = fallback_ean.get("value", fallback_ean.get("code", ""))
-                else:
-                    ean = str(fallback_ean) if fallback_ean else ""
-            
-            # Цены - handle different structures
+            # Цены
             price_data = item.get("priceData", {})
-            if isinstance(price_data, list):
-                price_data = price_data[0] if price_data else {}
-            
-            # Debug price structure
-            if isinstance(price_data, dict):
-                print(f"Consum priceData keys: {list(price_data.keys())[:8]}")
-            
-            prices = price_data.get("prices", {}) if isinstance(price_data, dict) else {}
-            if isinstance(prices, list):
-                prices = prices[0] if prices else {}
-            
-            # Debug prices
-            if isinstance(prices, dict):
-                print(f"Consum prices: {prices}")
-            
-            price = 0.0
-            price_per_liter = 0.0
-            
-            if isinstance(prices, dict):
-                # New structure: prices.value.centAmount
-                value = prices.get("value", {})
-                if isinstance(value, dict):
-                    price = float(value.get("centAmount", 0) or 0)
-                    price_per_liter = float(value.get("centUnitAmount", 0) or 0)
-                
-                # Fallback to old structure
-                if price == 0:
-                    price = float(prices.get("price", 0) or 0)
-                if price_per_liter == 0:
-                    price_per_liter = float(prices.get("pricePerUnit", 0) or 0)
-            
-            # Fallback price fields - check priceData directly
-            if price == 0 and isinstance(price_data, dict):
-                price = float(price_data.get("price", 0) or 0)
-                if price == 0:
-                    price = float(price_data.get("unitPrice", 0) or 0)
-            
-            # Fallback to item level
-            if price == 0:
-                price = float(item.get("price", item.get("unitPrice", 0)) or 0)
-            if price_per_liter == 0:
-                price_per_liter = float(item.get("pricePerUnit", item.get("referencePrice", 0)) or 0)
-            
-            print(f"Consum parsed price: {price}")
-            
-            # Skip if no valid price
-            if price == 0:
-                return None
+            price = float(price_data.get("prices", {}).get("price", 0))
+            price_per_liter = float(price_data.get("prices", {}).get("pricePerUnit", 0))
             
             # Акционная цена
             discount_price = None
             discount_percent = None
-            offers = price_data.get("offers", []) if isinstance(price_data, dict) else []
-            if offers and isinstance(offers, list) and len(offers) > 0:
+            offers = price_data.get("offers", [])
+            if offers:
                 offer = offers[0]
-                if isinstance(offer, dict):
-                    discount_price = float(offer.get("price", 0) or 0)
-                    if price > 0 and discount_price > 0:
-                        discount_percent = int((1 - discount_price / price) * 100)
+                discount_price = float(offer.get("price", 0))
+                if price > 0 and discount_price > 0:
+                    discount_percent = int((1 - discount_price / price) * 100)
             
             # URL и изображение
-            slug = product_data.get("slug", "") if isinstance(product_data, dict) else ""
-            if isinstance(slug, dict):
-                slug = slug.get("value", slug.get("url", ""))
-            slug = str(slug) if slug else ""
-            
-            if not slug:
-                fallback_slug = item.get("slug", item.get("url", ""))
-                if isinstance(fallback_slug, dict):
-                    slug = fallback_slug.get("value", "")
-                else:
-                    slug = str(fallback_slug) if fallback_slug else ""
-            
-            url = f"https://tienda.consum.es/es/p/{slug}/{product_id}" if slug else f"https://tienda.consum.es/es/p/{product_id}"
-            
-            image_url = ""
-            if isinstance(product_data, dict):
-                img = product_data.get("imageURL", product_data.get("image", ""))
-                if isinstance(img, dict):
-                    image_url = img.get("url", img.get("src", ""))
-                else:
-                    image_url = str(img) if img else ""
-            if not image_url:
-                fallback_img = item.get("imageURL", item.get("image", item.get("thumbnail", "")))
-                if isinstance(fallback_img, dict):
-                    image_url = fallback_img.get("url", fallback_img.get("src", ""))
-                else:
-                    image_url = str(fallback_img) if fallback_img else ""
+            slug = item.get("productData", {}).get("slug", "")
+            url = f"https://tienda.consum.es/es/p/{slug}/{product_id}"
+            image_url = item.get("productData", {}).get("imageURL", "")
             
             # Определение региона из названия
             region = self._extract_region(name)
