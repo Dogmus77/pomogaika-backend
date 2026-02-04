@@ -80,19 +80,46 @@ class ConsumParser:
             # Debug: print response structure
             print(f"Consum API response keys: {data.keys() if isinstance(data, dict) else type(data)}")
             
+            # Check what's inside catalog
+            if isinstance(data, dict) and "catalog" in data:
+                catalog = data["catalog"]
+                print(f"Consum catalog type: {type(catalog)}, length: {len(catalog) if hasattr(catalog, '__len__') else 'N/A'}")
+                if isinstance(catalog, dict):
+                    print(f"Consum catalog keys: {catalog.keys()}")
+                elif isinstance(catalog, list) and len(catalog) > 0:
+                    print(f"Consum first item keys: {catalog[0].keys() if isinstance(catalog[0], dict) else type(catalog[0])}")
+            
             wines = []
             
             # Try different response structures
             products = []
             if isinstance(data, dict):
-                products = data.get("products", data.get("results", data.get("items", [])))
-                # Also check nested structure
-                if not products and "data" in data:
-                    products = data["data"].get("products", data["data"].get("results", []))
+                # New structure: products are in 'catalog' key
+                catalog = data.get("catalog", [])
+                
+                if isinstance(catalog, list):
+                    products = catalog
+                elif isinstance(catalog, dict):
+                    # Catalog might have nested products
+                    products = catalog.get("products", catalog.get("items", catalog.get("results", [])))
+                    if not products:
+                        # Maybe catalog itself contains product data
+                        products = [catalog] if "id" in catalog or "name" in catalog else []
+                
+                # Fallback to other keys
+                if not products:
+                    products = data.get("products", data.get("results", data.get("items", [])))
+                    
             elif isinstance(data, list):
                 products = data
             
             print(f"Consum found {len(products)} raw products")
+            
+            # Debug first product structure
+            if products and len(products) > 0:
+                first = products[0]
+                if isinstance(first, dict):
+                    print(f"Consum first product keys: {list(first.keys())[:10]}")
             
             for item in products:
                 wine = self._parse_product(item)
