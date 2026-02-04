@@ -87,36 +87,96 @@ class ConsumParser:
             print(f"Consum API error: {e}")
             return []
     
+    def _safe_get(self, data, key, default=None):
+        """Safely get value from dict or list"""
+        if isinstance(data, dict):
+            return data.get(key, default)
+        elif isinstance(data, list) and len(data) > 0:
+            # If it's a list, try to get from first element
+            if isinstance(data[0], dict):
+                return data[0].get(key, default)
+        return default
+    
     def _parse_product(self, item: dict) -> Optional[Wine]:
         """Парсинг продукта в объект Wine"""
         try:
+            # Handle both old and new API structures
+            if isinstance(item, list):
+                if len(item) == 0:
+                    return None
+                item = item[0] if isinstance(item[0], dict) else {"id": str(item[0])}
+            
             # Базовые данные
             product_id = str(item.get("id", ""))
-            name = item.get("productData", {}).get("name", "")
-            brand = item.get("productData", {}).get("brand", "")
             
-            # EAN код (уникально для Consum!)
-            ean = item.get("productData", {}).get("ean", "")
+            # productData can be dict or list
+            product_data = item.get("productData", {})
+            if isinstance(product_data, list):
+                product_data = product_data[0] if product_data else {}
             
-            # Цены
+            name = product_data.get("name", "") if isinstance(product_data, dict) else ""
+            brand = product_data.get("brand", "") if isinstance(product_data, dict) else ""
+            
+            # Fallback: try direct fields if productData is empty
+            if not name:
+                name = item.get("name", item.get("displayName", item.get("title", "")))
+            if not brand:
+                brand = item.get("brand", item.get("manufacturer", ""))
+            
+            # EAN код
+            ean = product_data.get("ean", "") if isinstance(product_data, dict) else ""
+            if not ean:
+                ean = item.get("ean", item.get("gtin", ""))
+            
+            # Цены - handle different structures
             price_data = item.get("priceData", {})
-            price = float(price_data.get("prices", {}).get("price", 0))
-            price_per_liter = float(price_data.get("prices", {}).get("pricePerUnit", 0))
+            if isinstance(price_data, list):
+                price_data = price_data[0] if price_data else {}
+            
+            prices = price_data.get("prices", {}) if isinstance(price_data, dict) else {}
+            if isinstance(prices, list):
+                prices = prices[0] if prices else {}
+            
+            price = 0.0
+            price_per_liter = 0.0
+            
+            if isinstance(prices, dict):
+                price = float(prices.get("price", 0) or 0)
+                price_per_liter = float(prices.get("pricePerUnit", 0) or 0)
+            
+            # Fallback price fields
+            if price == 0:
+                price = float(item.get("price", item.get("unitPrice", 0)) or 0)
+            if price_per_liter == 0:
+                price_per_liter = float(item.get("pricePerUnit", item.get("referencePrice", 0)) or 0)
+            
+            # Skip if no valid price
+            if price == 0:
+                return None
             
             # Акционная цена
             discount_price = None
             discount_percent = None
-            offers = price_data.get("offers", [])
-            if offers:
+            offers = price_data.get("offers", []) if isinstance(price_data, dict) else []
+            if offers and isinstance(offers, list) and len(offers) > 0:
                 offer = offers[0]
-                discount_price = float(offer.get("price", 0))
-                if price > 0 and discount_price > 0:
-                    discount_percent = int((1 - discount_price / price) * 100)
+                if isinstance(offer, dict):
+                    discount_price = float(offer.get("price", 0) or 0)
+                    if price > 0 and discount_price > 0:
+                        discount_percent = int((1 - discount_price / price) * 100)
             
             # URL и изображение
-            slug = item.get("productData", {}).get("slug", "")
-            url = f"https://tienda.consum.es/es/p/{slug}/{product_id}"
-            image_url = item.get("productData", {}).get("imageURL", "")
+            slug = product_data.get("slug", "") if isinstance(product_data, dict) else ""
+            if not slug:
+                slug = item.get("slug", item.get("url", ""))
+            
+            url = f"https://tienda.consum.es/es/p/{slug}/{product_id}" if slug else f"https://tienda.consum.es/es/p/{product_id}"
+            
+            image_url = ""
+            if isinstance(product_data, dict):
+                image_url = product_data.get("imageURL", product_data.get("image", ""))
+            if not image_url:
+                image_url = item.get("imageURL", item.get("image", item.get("thumbnail", "")))
             
             # Определение региона из названия
             region = self._extract_region(name)
