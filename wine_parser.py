@@ -62,21 +62,39 @@ class ConsumParser:
         """Поиск вин по типу"""
         query = f"vino {wine_type.value}"
         
-        url = f"{self.BASE_URL}/catalog/product"
+        # New Consum API endpoint (changed from /catalog/product)
+        url = f"{self.BASE_URL}/catalog/searcher/products"
         params = {
             "q": query,
             "limit": limit,
-            "page": 1,
-            "showRecommendations": "false"
+            "showRecommendations": "false",
+            "showProducts": "true",
+            "showRecipes": "false"
         }
         
         try:
-            response = self.session.get(url, params=params)
+            response = self.session.get(url, params=params, timeout=15)
             response.raise_for_status()
             data = response.json()
             
+            # Debug: print response structure
+            print(f"Consum API response keys: {data.keys() if isinstance(data, dict) else type(data)}")
+            
             wines = []
-            for item in data.get("products", []):
+            
+            # Try different response structures
+            products = []
+            if isinstance(data, dict):
+                products = data.get("products", data.get("results", data.get("items", [])))
+                # Also check nested structure
+                if not products and "data" in data:
+                    products = data["data"].get("products", data["data"].get("results", []))
+            elif isinstance(data, list):
+                products = data
+            
+            print(f"Consum found {len(products)} raw products")
+            
+            for item in products:
                 wine = self._parse_product(item)
                 if wine:
                     wines.append(wine)
@@ -85,6 +103,9 @@ class ConsumParser:
             
         except requests.RequestException as e:
             print(f"Consum API error: {e}")
+            return []
+        except Exception as e:
+            print(f"Consum parsing error: {e}")
             return []
     
     def _safe_get(self, data, key, default=None):
