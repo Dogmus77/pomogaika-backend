@@ -195,8 +195,17 @@ class ConsumParser:
             price_per_liter = 0.0
             
             if isinstance(prices, dict):
-                price = float(prices.get("price", 0) or 0)
-                price_per_liter = float(prices.get("pricePerUnit", 0) or 0)
+                # New structure: prices.value.centAmount
+                value = prices.get("value", {})
+                if isinstance(value, dict):
+                    price = float(value.get("centAmount", 0) or 0)
+                    price_per_liter = float(value.get("centUnitAmount", 0) or 0)
+                
+                # Fallback to old structure
+                if price == 0:
+                    price = float(prices.get("price", 0) or 0)
+                if price_per_liter == 0:
+                    price_per_liter = float(prices.get("pricePerUnit", 0) or 0)
             
             # Fallback price fields - check priceData directly
             if price == 0 and isinstance(price_data, dict):
@@ -209,6 +218,8 @@ class ConsumParser:
                 price = float(item.get("price", item.get("unitPrice", 0)) or 0)
             if price_per_liter == 0:
                 price_per_liter = float(item.get("pricePerUnit", item.get("referencePrice", 0)) or 0)
+            
+            print(f"Consum parsed price: {price}")
             
             # Skip if no valid price
             if price == 0:
