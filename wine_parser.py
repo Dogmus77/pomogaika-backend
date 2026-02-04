@@ -94,17 +94,15 @@ class ConsumParser:
             # Try different response structures
             products = []
             if isinstance(data, dict):
-                # New structure: products are in 'catalog' key
-                catalog = data.get("catalog", [])
+                # New structure: catalog is a dict with 'products' key inside
+                catalog = data.get("catalog", {})
                 
-                if isinstance(catalog, list):
+                if isinstance(catalog, dict):
+                    # Products are inside catalog['products']
+                    products = catalog.get("products", [])
+                    print(f"Consum: got {len(products)} products from catalog.products")
+                elif isinstance(catalog, list):
                     products = catalog
-                elif isinstance(catalog, dict):
-                    # Catalog might have nested products
-                    products = catalog.get("products", catalog.get("items", catalog.get("results", [])))
-                    if not products:
-                        # Maybe catalog itself contains product data
-                        products = [catalog] if "id" in catalog or "name" in catalog else []
                 
                 # Fallback to other keys
                 if not products:
@@ -181,9 +179,17 @@ class ConsumParser:
             if isinstance(price_data, list):
                 price_data = price_data[0] if price_data else {}
             
+            # Debug price structure
+            if isinstance(price_data, dict):
+                print(f"Consum priceData keys: {list(price_data.keys())[:8]}")
+            
             prices = price_data.get("prices", {}) if isinstance(price_data, dict) else {}
             if isinstance(prices, list):
                 prices = prices[0] if prices else {}
+            
+            # Debug prices
+            if isinstance(prices, dict):
+                print(f"Consum prices: {prices}")
             
             price = 0.0
             price_per_liter = 0.0
@@ -192,7 +198,13 @@ class ConsumParser:
                 price = float(prices.get("price", 0) or 0)
                 price_per_liter = float(prices.get("pricePerUnit", 0) or 0)
             
-            # Fallback price fields
+            # Fallback price fields - check priceData directly
+            if price == 0 and isinstance(price_data, dict):
+                price = float(price_data.get("price", 0) or 0)
+                if price == 0:
+                    price = float(price_data.get("unitPrice", 0) or 0)
+            
+            # Fallback to item level
             if price == 0:
                 price = float(item.get("price", item.get("unitPrice", 0)) or 0)
             if price_per_liter == 0:
