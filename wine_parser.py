@@ -1,0 +1,388 @@
+"""
+Wine Parser PoC - Consum & Mercadona
+Получение данных о винах из испанских супермаркетов
+"""
+
+import requests
+import json
+from dataclasses import dataclass, asdict
+from typing import Optional
+from enum import Enum
+
+
+class WineType(Enum):
+    TINTO = "tinto"
+    BLANCO = "blanco"
+    ROSADO = "rosado"
+    ESPUMOSO = "espumoso"
+    CAVA = "cava"
+
+
+class Store(Enum):
+    CONSUM = "consum"
+    MERCADONA = "mercadona"
+
+
+@dataclass
+class Wine:
+    """Унифицированная структура данных о вине"""
+    id: str
+    name: str
+    brand: str
+    price: float
+    price_per_liter: float
+    store: str
+    url: str
+    image_url: Optional[str] = None
+    ean: Optional[str] = None  # Только Consum
+    region: Optional[str] = None  # DO Rioja, Ribera del Duero, etc.
+    wine_type: Optional[str] = None
+    discount_price: Optional[float] = None
+    discount_percent: Optional[int] = None
+
+
+class ConsumParser:
+    """
+    Парсер для tienda.consum.es
+    Использует REST API с привязкой к Codigo Postal
+    """
+    
+    BASE_URL = "https://tienda.consum.es/api/rest/V1.0"
+    
+    def __init__(self, postal_code: str = "46001"):
+        self.postal_code = postal_code
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)",
+            "Accept": "application/json",
+            "Accept-Language": "es-ES,es;q=0.9",
+        })
+    
+    def search_wines(self, wine_type: WineType = WineType.TINTO, limit: int = 50) -> list[Wine]:
+        """Поиск вин по типу"""
+        query = f"vino {wine_type.value}"
+        
+        url = f"{self.BASE_URL}/catalog/product"
+        params = {
+            "q": query,
+            "limit": limit,
+            "page": 1,
+            "showRecommendations": "false"
+        }
+        
+        try:
+            response = self.session.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            wines = []
+            for item in data.get("products", []):
+                wine = self._parse_product(item)
+                if wine:
+                    wines.append(wine)
+            
+            return wines
+            
+        except requests.RequestException as e:
+            print(f"Consum API error: {e}")
+            return []
+    
+    def _parse_product(self, item: dict) -> Optional[Wine]:
+        """Парсинг продукта в объект Wine"""
+        try:
+            # Базовые данные
+            product_id = str(item.get("id", ""))
+            name = item.get("productData", {}).get("name", "")
+            brand = item.get("productData", {}).get("brand", "")
+            
+            # EAN код (уникально для Consum!)
+            ean = item.get("productData", {}).get("ean", "")
+            
+            # Цены
+            price_data = item.get("priceData", {})
+            price = float(price_data.get("prices", {}).get("price", 0))
+            price_per_liter = float(price_data.get("prices", {}).get("pricePerUnit", 0))
+            
+            # Акционная цена
+            discount_price = None
+            discount_percent = None
+            offers = price_data.get("offers", [])
+            if offers:
+                offer = offers[0]
+                discount_price = float(offer.get("price", 0))
+                if price > 0 and discount_price > 0:
+                    discount_percent = int((1 - discount_price / price) * 100)
+            
+            # URL и изображение
+            slug = item.get("productData", {}).get("slug", "")
+            url = f"https://tienda.consum.es/es/p/{slug}/{product_id}"
+            image_url = item.get("productData", {}).get("imageURL", "")
+            
+            # Определение региона из названия
+            region = self._extract_region(name)
+            
+            return Wine(
+                id=f"consum_{product_id}",
+                name=name,
+                brand=brand,
+                price=price,
+                price_per_liter=price_per_liter,
+                store=Store.CONSUM.value,
+                url=url,
+                image_url=image_url,
+                ean=ean,
+                region=region,
+                wine_type=self._extract_wine_type(name),
+                discount_price=discount_price,
+                discount_percent=discount_percent
+            )
+        except Exception as e:
+            print(f"Error parsing Consum product: {e}")
+            return None
+    
+    def _extract_region(self, name: str) -> Optional[str]:
+        """Извлечение региона DO из названия"""
+        regions = [
+            "Rioja", "Ribera del Duero", "Rueda", "Rías Baixas",
+            "Priorat", "Penedès", "Jumilla", "Toro", "Navarra",
+            "La Mancha", "Valdepeñas", "Utiel-Requena", "Cariñena"
+        ]
+        name_lower = name.lower()
+        for region in regions:
+            if region.lower() in name_lower:
+                return region
+        return None
+    
+    def _extract_wine_type(self, name: str) -> Optional[str]:
+        """Извлечение типа вина из названия"""
+        name_lower = name.lower()
+        if "tinto" in name_lower:
+            return WineType.TINTO.value
+        elif "blanco" in name_lower:
+            return WineType.BLANCO.value
+        elif "rosado" in name_lower:
+            return WineType.ROSADO.value
+        elif "cava" in name_lower:
+            return WineType.CAVA.value
+        elif "espumoso" in name_lower:
+            return WineType.ESPUMOSO.value
+        return None
+
+
+class MercadonaParser:
+    """
+    Парсер для tienda.mercadona.es
+    Использует Algolia API с привязкой к складу (warehouse)
+    """
+    
+    ALGOLIA_APP_ID = "7UZJKL1DJ0"
+    ALGOLIA_API_KEY = "9d8f2e39e90df472b4f2e559a116fe17"
+    
+    # Склады по регионам (из URL индекса products_prod_XXX_es)
+    WAREHOUSES = {
+        "valencia": "vlc1",
+        "madrid": "mad1",
+        "barcelona": "bcn1",
+        "sevilla": "svq1",
+        "malaga": "agp1",
+    }
+    
+    def __init__(self, warehouse: str = "vlc1"):
+        self.warehouse = warehouse
+        self.index = f"products_prod_{warehouse}_es"
+        self.base_url = f"https://{self.ALGOLIA_APP_ID}-dsn.algolia.net/1/indexes/{self.index}/query"
+        
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Content-Type": "application/json",
+            "x-algolia-api-key": self.ALGOLIA_API_KEY,
+            "x-algolia-application-id": self.ALGOLIA_APP_ID,
+        })
+    
+    def search_wines(self, wine_type: WineType = WineType.TINTO, limit: int = 50) -> list[Wine]:
+        """Поиск вин по типу"""
+        query = f"vino {wine_type.value}"
+        
+        payload = {
+            "query": query,
+            "hitsPerPage": limit,
+            "page": 0
+        }
+        
+        try:
+            response = self.session.post(self.base_url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            
+            wines = []
+            for hit in data.get("hits", []):
+                wine = self._parse_hit(hit)
+                if wine:
+                    wines.append(wine)
+            
+            return wines
+            
+        except requests.RequestException as e:
+            print(f"Mercadona API error: {e}")
+            return []
+    
+    def _parse_hit(self, hit: dict) -> Optional[Wine]:
+        """Парсинг результата Algolia в объект Wine"""
+        try:
+            product_id = str(hit.get("id", ""))
+            name = hit.get("display_name", "")
+            brand = hit.get("brand", "")
+            
+            # Цены
+            price_info = hit.get("price_instructions", {})
+            price = float(price_info.get("unit_price", 0))
+            price_per_liter = float(price_info.get("reference_price", 0))
+            
+            # Акция
+            discount_price = None
+            discount_percent = None
+            previous_price = price_info.get("previous_unit_price")
+            if previous_price:
+                discount_price = price
+                price = float(previous_price)
+                discount_percent = int((1 - discount_price / price) * 100)
+            
+            # URL
+            url = hit.get("share_url", f"https://tienda.mercadona.es/product/{product_id}")
+            
+            # Изображение
+            image_url = hit.get("thumbnail", "")
+            
+            return Wine(
+                id=f"mercadona_{product_id}",
+                name=name,
+                brand=brand,
+                price=price,
+                price_per_liter=price_per_liter,
+                store=Store.MERCADONA.value,
+                url=url,
+                image_url=image_url,
+                ean=None,  # Mercadona не возвращает EAN
+                region=self._extract_region(name),
+                wine_type=self._extract_wine_type(name),
+                discount_price=discount_price,
+                discount_percent=discount_percent
+            )
+        except Exception as e:
+            print(f"Error parsing Mercadona hit: {e}")
+            return None
+    
+    def _extract_region(self, name: str) -> Optional[str]:
+        """Извлечение региона DO из названия"""
+        regions = [
+            "Rioja", "Ribera del Duero", "Rueda", "Rías Baixas",
+            "Priorat", "Penedès", "Jumilla", "Toro", "Navarra",
+            "La Mancha", "Valdepeñas", "Utiel-Requena", "Cariñena"
+        ]
+        name_lower = name.lower()
+        for region in regions:
+            if region.lower() in name_lower:
+                return region
+        return None
+    
+    def _extract_wine_type(self, name: str) -> Optional[str]:
+        """Извлечение типа вина из названия"""
+        name_lower = name.lower()
+        if "tinto" in name_lower:
+            return WineType.TINTO.value
+        elif "blanco" in name_lower:
+            return WineType.BLANCO.value
+        elif "rosado" in name_lower:
+            return WineType.ROSADO.value
+        elif "cava" in name_lower:
+            return WineType.CAVA.value
+        elif "espumoso" in name_lower:
+            return WineType.ESPUMOSO.value
+        return None
+
+
+class WineAggregator:
+    """
+    Агрегатор вин из всех магазинов
+    """
+    
+    def __init__(self, postal_code: str = "46001"):
+        self.postal_code = postal_code
+        self.consum = ConsumParser(postal_code)
+        self.mercadona = MercadonaParser()  # TODO: маппинг postal_code -> warehouse
+    
+    def search_all(self, wine_type: WineType = WineType.TINTO, limit_per_store: int = 20) -> list[Wine]:
+        """Поиск вин во всех магазинах"""
+        all_wines = []
+        
+        # Consum
+        consum_wines = self.consum.search_wines(wine_type, limit_per_store)
+        all_wines.extend(consum_wines)
+        print(f"✅ Consum: {len(consum_wines)} wines")
+        
+        # Mercadona
+        mercadona_wines = self.mercadona.search_wines(wine_type, limit_per_store)
+        all_wines.extend(mercadona_wines)
+        print(f"✅ Mercadona: {len(mercadona_wines)} wines")
+        
+        return all_wines
+    
+    def get_recommendations(
+        self, 
+        wine_type: WineType,
+        max_price: float = 15.0,
+        prefer_discount: bool = True
+    ) -> list[Wine]:
+        """
+        Получение рекомендаций с фильтрацией
+        """
+        wines = self.search_all(wine_type, limit_per_store=50)
+        
+        # Фильтр по цене
+        filtered = [w for w in wines if w.price <= max_price]
+        
+        # Сортировка
+        if prefer_discount:
+            # Сначала со скидкой, потом по цене
+            filtered.sort(key=lambda w: (
+                0 if w.discount_price else 1,
+                w.price
+            ))
+        else:
+            filtered.sort(key=lambda w: w.price)
+        
+        return filtered
+
+
+def main():
+    """Демонстрация работы парсеров"""
+    print("🍷 Wine Parser PoC\n")
+    
+    aggregator = WineAggregator(postal_code="46001")
+    
+    # Поиск красных вин до 10€
+    print("Searching for red wines under 10€...\n")
+    wines = aggregator.get_recommendations(
+        wine_type=WineType.TINTO,
+        max_price=10.0,
+        prefer_discount=True
+    )
+    
+    print(f"\n📊 Found {len(wines)} wines:\n")
+    
+    for i, wine in enumerate(wines[:10], 1):
+        discount_info = ""
+        if wine.discount_price:
+            discount_info = f" (🏷️ {wine.discount_price}€, -{wine.discount_percent}%)"
+        
+        region_info = f" [{wine.region}]" if wine.region else ""
+        ean_info = f" EAN:{wine.ean}" if wine.ean else ""
+        
+        print(f"{i}. {wine.name}")
+        print(f"   💰 {wine.price}€{discount_info} | {wine.price_per_liter}€/L")
+        print(f"   🏪 {wine.store.upper()}{region_info}{ean_info}")
+        print(f"   🔗 {wine.url}\n")
+
+
+if __name__ == "__main__":
+    main()
