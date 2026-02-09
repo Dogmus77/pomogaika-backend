@@ -887,7 +887,8 @@ class DIAParser:
 
 class WineAggregator:
     """
-    Wine aggregator from all stores
+    Wine aggregator from all stores.
+    Uses ThreadPoolExecutor for parallel fetching.
     """
     
     def __init__(self, postal_code: str = "46001"):
@@ -896,27 +897,69 @@ class WineAggregator:
         self.mercadona = MercadonaParser()  # TODO: postal_code -> warehouse mapping
         self.masymas = MasymasParser(postal_code)
         self.dia = DIAParser(postal_code)
+        self._parsers = [self.consum, self.mercadona, self.masymas, self.dia]
     
     def search_all(self, wine_type: WineType = WineType.TINTO, limit_per_store: int = 20) -> list[Wine]:
-        """Search wines across all stores"""
+        """Search wines across all stores IN PARALLEL"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
         all_wines = []
         
-        # Consum
-        consum_wines = self.consum.search_wines(wine_type, limit_per_store)
-        all_wines.extend(consum_wines)
+        def fetch_store(parser):
+            try:
+                return parser.search_wines(wine_type, limit_per_store)
+            except Exception as e:
+                store_name = parser.__class__.__name__
+                print(f"⚠️ {store_name} error: {e}")
+                return []
         
-        # Mercadona
-        mercadona_wines = self.mercadona.search_wines(wine_type, limit_per_store)
-        all_wines.extend(mercadona_wines)
+        # Fetch all 4 stores simultaneously
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(fetch_store, p): p for p in self._parsers}
+            for future in as_completed(futures, timeout=20):
+                try:
+                    wines = future.result()
+                    all_wines.extend(wines)
+                except Exception as e:
+                    parser = futures[future]
+                    print(f"⚠️ {parser.__class__.__name__} timeout/error: {e}")
         
-        # Masymas
-        masymas_wines = self.masymas.search_wines(wine_type, limit_per_store)
-        all_wines.extend(masymas_wines)
+        return all_wines
+    
+    def search_all_types(self, wine_types: list[WineType] = None, limit_per_store: int = 30) -> list[Wine]:
+        """Search ALL wine types across all stores in parallel (one batch)"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         
-        # DIA
-        dia_wines = self.dia.search_wines(wine_type, limit_per_store)
-        all_wines.extend(dia_wines)
+        if wine_types is None:
+            wine_types = [WineType.TINTO, WineType.BLANCO, WineType.ROSADO, WineType.CAVA]
         
+        all_wines = []
+        
+        # Create tasks: 4 stores × 4 types = 16 tasks, all in parallel
+        def fetch_task(parser, wt):
+            try:
+                return parser.search_wines(wt, limit_per_store)
+            except Exception as e:
+                print(f"⚠️ {parser.__class__.__name__}/{wt.value} error: {e}")
+                return []
+        
+        tasks = []
+        for parser in self._parsers:
+            for wt in wine_types:
+                tasks.append((parser, wt))
+        
+        # Run all 16 tasks in parallel (max 8 workers to not overwhelm)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(fetch_task, p, wt): (p, wt) for p, wt in tasks}
+            for future in as_completed(futures, timeout=30):
+                try:
+                    wines = future.result()
+                    all_wines.extend(wines)
+                except Exception as e:
+                    p, wt = futures[future]
+                    print(f"⚠️ {p.__class__.__name__}/{wt.value} timeout: {e}")
+        
+        print(f"✅ Aggregator: {len(all_wines)} total wines from {len(tasks)} tasks")
         return all_wines
     
     def get_recommendations(
