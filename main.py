@@ -39,6 +39,9 @@ wine_cache = {
     "is_loading": False
 }
 
+# Event: set when cache has data (requests wait for this)
+cache_ready = asyncio.Event()
+
 
 # === Startup: pre-warm cache ===
 
@@ -56,6 +59,9 @@ async def _warmup_cache():
         print(f"🔥 Cache warmed: {len(wine_cache['wines'])} wines ready")
     except Exception as e:
         print(f"⚠️ Cache warmup failed: {e}")
+    finally:
+        # Always signal ready (even if failed — don't block requests forever)
+        cache_ready.set()
 
 
 # === Models ===
@@ -236,10 +242,16 @@ async def recommend_wines(
     min_price: float = Query(0, description="Minimum price"),
     max_price: float = Query(30.0, description="Maximum price"),
     postal_code: str = Query("46001", description="Postal code"),
-    limit: int = Query(15, description="Number of results"),
+    limit: int = Query(50, description="Number of results"),
     lang: str = Query("ru", description="Language: ru, uk, be, en, es")
 ):
     """Get wine recommendations with real store data"""
+    
+    # Wait for cache to be ready (max 90 seconds on cold start)
+    try:
+        await asyncio.wait_for(cache_ready.wait(), timeout=90)
+    except asyncio.TimeoutError:
+        print("⚠️ Cache warmup timeout, proceeding with what we have")
     
     # 1. Get expert recommendations
     expert_recs = sommelier.get_recommendations(dish, cooking_method, meal_time, cuisine)
@@ -286,24 +298,62 @@ async def recommend_wines(
         
         return min(score, 100)
     
-    # 6. Add scores and sort
-    scored_wines = []
+    # 6. Add scores
     for wine in filtered:
         wine.match_score = score_wine(wine)
         wine.expert_note = get_expert_note(wine, primary_rec, lang)
-        scored_wines.append(wine)
     
-    scored_wines.sort(key=lambda w: w.match_score or 0, reverse=True)
+    # 7. Store-diverse selection: ensure each store is represented
+    scored_wines = _diverse_selection(filtered, limit)
     
     return RecommendationResponse(
-        total=len(scored_wines),
+        total=len(filtered),
         expert_summary=translate_summary(primary_rec.description, lang),
         recommended_style=primary_rec.style.value,
         recommended_grapes=primary_rec.grape_varieties,
         recommended_regions=primary_rec.regions,
-        wines=scored_wines[:limit],
+        wines=scored_wines,
         data_source=data_source
     )
+
+
+def _diverse_selection(wines: list, limit: int, min_per_store: int = 3) -> list:
+    """Select wines ensuring each store is represented fairly"""
+    if len(wines) <= limit:
+        wines.sort(key=lambda w: w.match_score or 0, reverse=True)
+        return wines
+    
+    # Group by store
+    by_store: dict[str, list] = {}
+    for w in wines:
+        by_store.setdefault(w.store, []).append(w)
+    
+    # Sort each store's wines by score
+    for store in by_store:
+        by_store[store].sort(key=lambda w: w.match_score or 0, reverse=True)
+    
+    selected = []
+    selected_ids = set()
+    
+    # Phase 1: take top min_per_store from each store
+    for store, store_wines in by_store.items():
+        for w in store_wines[:min_per_store]:
+            if w.id not in selected_ids:
+                selected.append(w)
+                selected_ids.add(w.id)
+    
+    # Phase 2: fill remaining slots by global score
+    remaining = [w for w in wines if w.id not in selected_ids]
+    remaining.sort(key=lambda w: w.match_score or 0, reverse=True)
+    
+    for w in remaining:
+        if len(selected) >= limit:
+            break
+        selected.append(w)
+    
+    # Final sort by score
+    selected.sort(key=lambda w: w.match_score or 0, reverse=True)
+    return selected
 
 
 # === Localization ===
@@ -652,6 +702,12 @@ async def search_wines(
     limit: int = Query(30, description="Number of results")
 ):
     """Search wines with filters"""
+    
+    # Wait for cache to be ready
+    try:
+        await asyncio.wait_for(cache_ready.wait(), timeout=90)
+    except asyncio.TimeoutError:
+        pass
     
     all_wines = await get_wines(postal_code)
     filtered = all_wines
