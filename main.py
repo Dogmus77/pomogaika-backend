@@ -66,7 +66,7 @@ class RecommendationResponse(BaseModel):
     recommended_grapes: list[str]
     recommended_regions: list[str]
     wines: list[WineResponse]
-    data_source: str  # "live" Ð¸Ð»Ð¸ "cache"
+    data_source: str  # "live" or "cache"
 
 
 class ExpertRecommendation(BaseModel):
