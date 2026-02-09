@@ -476,9 +476,11 @@ class MasymasParser:
         self.postal_code = postal_code
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
             "Accept": "application/json",
             "Accept-Language": "es-ES,es;q=0.9",
+            "Referer": "https://tienda.masymas.com/es",
+            "Origin": "https://tienda.masymas.com",
         })
     
     def search_wines(self, wine_type: WineType = WineType.TINTO, limit: int = 50) -> list[Wine]:
@@ -495,17 +497,37 @@ class MasymasParser:
         
         try:
             response = self.session.get(self.API_URL, params=params, timeout=15)
+            print(f"🔍 Masymas: status={response.status_code}, url={response.url}")
             response.raise_for_status()
             data = response.json()
             
             wines = []
             catalog = data.get("catalog", {})
+            
+            if not isinstance(catalog, dict):
+                print(f"⚠️ Masymas: unexpected catalog type: {type(catalog)}, keys: {list(data.keys()) if isinstance(data, dict) else 'not dict'}")
+                return []
+            
             products = catalog.get("products", [])
+            total_count = catalog.get("totalCount", 0)
+            print(f"🔍 Masymas: totalCount={total_count}, products in response={len(products)}")
             
             for item in products:
                 wine = self._parse_product(item, wine_type)
                 if wine:
                     wines.append(wine)
+                else:
+                    # Debug: why was product skipped?
+                    pid = item.get("id", "?")
+                    pname = item.get("productData", {}).get("name", "?") if isinstance(item.get("productData"), dict) else "?"
+                    pd = item.get("priceData", {})
+                    prices = pd.get("prices", []) if isinstance(pd, dict) else []
+                    price_val = 0
+                    for p in prices:
+                        if isinstance(p, dict) and p.get("id") == "PRICE":
+                            v = p.get("value", {})
+                            price_val = v.get("centAmount", 0) if isinstance(v, dict) else 0
+                    print(f"⚠️ Masymas: skipped product id={pid} name='{pname}' price={price_val}")
             
             print(f"✅ Masymas: {len(wines)} wines (from {len(products)} products)")
             return wines
