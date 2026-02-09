@@ -277,7 +277,7 @@ def get_expert_note(wine: WineResponse, rec) -> str:
             return "Classic Rioja - balance of fruit and oak"
         elif "Ribera" in wine.region:
             return "Ribera del Duero - intensity and depth"
-        elif "RÃ­as Baixas" in wine.region:
+        elif "Rías Baixas" in wine.region:
             return "Albarino from Galicia - ocean minerality"
         elif "Rueda" in wine.region:
             return "Verdejo - herbs and citrus"
@@ -289,7 +289,7 @@ def get_expert_note(wine: WineResponse, rec) -> str:
             return "Mencia - elegance of Bierzo"
         elif "Navarra" in wine.region:
             return "Navarra - capital of rose wines"
-        elif "PenedÃ¨s" in wine.region:
+        elif "Penedès" in wine.region:
             return "Penedes - home of Spanish Cava"
     
     if wine.wine_type == "cava":
@@ -350,13 +350,13 @@ async def get_stores():
                 "id": "consum",
                 "name": "Consum",
                 "has_ean": True,
-                "coverage": "Valencia, CataluÃ±a, Murcia, Castilla-La Mancha"
+                "coverage": "Valencia, Cataluña, Murcia, Castilla-La Mancha"
             },
             {
                 "id": "mercadona",
                 "name": "Mercadona",
                 "has_ean": False,
-                "coverage": "Toda EspaÃ±a"
+                "coverage": "Toda España"
             },
             {
                 "id": "masymas",
@@ -369,7 +369,7 @@ async def get_stores():
                 "id": "dia",
                 "name": "DIA",
                 "has_ean": False,
-                "coverage": "Toda EspaÃ±a",
+                "coverage": "Toda España",
                 "status": "stub"
             }
         ]
