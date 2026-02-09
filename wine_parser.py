@@ -1,6 +1,6 @@
 """
 Wine Parser PoC - Consum & Mercadona
-ÐŸÐ¾Ð»ÑƒÑ‡ÐµÐ½Ð¸Ðµ Ð´Ð°Ð½Ð½Ñ‹Ñ… Ð¾ Ð²Ð¸Ð½Ð°Ñ… Ð¸Ð· Ð¸ÑÐ¿Ð°Ð½ÑÐºÐ¸Ñ… ÑÑƒÐ¿ÐµÑ€Ð¼Ð°Ñ€ÐºÐµÑ‚Ð¾Ð²
+Fetching wine data from Spanish supermarkets
 """
 
 import requests
@@ -27,7 +27,7 @@ class Store(Enum):
 
 @dataclass
 class Wine:
-    """Ð£Ð½Ð¸Ñ„Ð¸Ñ†Ð¸Ñ€Ð¾Ð²Ð°Ð½Ð½Ð°Ñ ÑÑ‚Ñ€ÑƒÐºÑ‚ÑƒÑ€Ð° Ð´Ð°Ð½Ð½Ñ‹Ñ… Ð¾ Ð²Ð¸Ð½Ðµ"""
+    """Unified wine data structure"""
     id: str
     name: str
     brand: str
@@ -36,7 +36,7 @@ class Wine:
     store: str
     url: str
     image_url: Optional[str] = None
-    ean: Optional[str] = None  # Ð¢Ð¾Ð»ÑŒÐºÐ¾ Consum
+    # Consum only
     region: Optional[str] = None  # DO Rioja, Ribera del Duero, etc.
     wine_type: Optional[str] = None
     discount_price: Optional[float] = None
@@ -45,8 +45,8 @@ class Wine:
 
 class ConsumParser:
     """
-    ÐŸÐ°Ñ€ÑÐµÑ€ Ð´Ð»Ñ tienda.consum.es
-    Ð˜ÑÐ¿Ð¾Ð»ÑŒÐ·ÑƒÐµÑ‚ REST API Ñ Ð¿Ñ€Ð¸Ð²ÑÐ·ÐºÐ¾Ð¹ Ðº Codigo Postal
+    Parser for tienda.consum.es
+    Uses REST API with postal code binding
     """
     
     BASE_URL = "https://tienda.consum.es/api/rest/V1.0"
@@ -61,7 +61,7 @@ class ConsumParser:
         })
     
     def search_wines(self, wine_type: WineType = WineType.TINTO, limit: int = 50) -> list[Wine]:
-        """ÐŸÐ¾Ð¸ÑÐº Ð²Ð¸Ð½ Ð¿Ð¾ Ñ‚Ð¸Ð¿Ñƒ"""
+        """Search wines by type"""
         query = f"vino {wine_type.value}"
         
         # New Consum API endpoint (changed from /catalog/product)
@@ -125,7 +125,7 @@ class ConsumParser:
         return default
     
     def _parse_product(self, item: dict) -> Optional[Wine]:
-        """ÐŸÐ°Ñ€ÑÐ¸Ð½Ð³ Ð¿Ñ€Ð¾Ð´ÑƒÐºÑ‚Ð° Ð² Ð¾Ð±ÑŠÐµÐºÑ‚ Wine"""
+        """Unified wine data structure"""
         try:
             # Handle both old and new API structures
             if isinstance(item, list):
@@ -133,7 +133,7 @@ class ConsumParser:
                     return None
                 item = item[0] if isinstance(item[0], dict) else {"id": str(item[0])}
             
-            # Ð‘Ð°Ð·Ð¾Ð²Ñ‹Ðµ Ð´Ð°Ð½Ð½Ñ‹Ðµ
+            # Base data
             product_id = str(item.get("id", ""))
             
             # productData can be dict or list
@@ -169,7 +169,7 @@ class ConsumParser:
                 else:
                     brand = str(fallback_brand) if fallback_brand else ""
             
-            # EAN ÐºÐ¾Ð´
+            # EAN код
             ean = product_data.get("ean", "") if isinstance(product_data, dict) else ""
             if isinstance(ean, dict):
                 ean = ean.get("value", ean.get("code", ""))
@@ -182,7 +182,7 @@ class ConsumParser:
                 else:
                     ean = str(fallback_ean) if fallback_ean else ""
             
-            # Ð¦ÐµÐ½Ñ‹ - handle different structures
+            # Prices - handle different structures
             price_data = item.get("priceData", {})
             if isinstance(price_data, list):
                 price_data = price_data[0] if price_data else {}
@@ -226,7 +226,7 @@ class ConsumParser:
             if price == 0:
                 return None
             
-            # ÐÐºÑ†Ð¸Ð¾Ð½Ð½Ð°Ñ Ñ†ÐµÐ½Ð°
+            # Discount price
             discount_price = None
             discount_percent = None
             offers = price_data.get("offers", []) if isinstance(price_data, dict) else []
@@ -237,7 +237,7 @@ class ConsumParser:
                     if price > 0 and discount_price > 0:
                         discount_percent = int((1 - discount_price / price) * 100)
             
-            # URL Ð¸ Ð¸Ð·Ð¾Ð±Ñ€Ð°Ð¶ÐµÐ½Ð¸Ðµ
+            # URL and image
             slug = product_data.get("slug", "") if isinstance(product_data, dict) else ""
             if isinstance(slug, dict):
                 slug = slug.get("value", slug.get("url", ""))
@@ -266,7 +266,7 @@ class ConsumParser:
                 else:
                     image_url = str(fallback_img) if fallback_img else ""
             
-            # ÐžÐ¿Ñ€ÐµÐ´ÐµÐ»ÐµÐ½Ð¸Ðµ Ñ€ÐµÐ³Ð¸Ð¾Ð½Ð° Ð¸Ð· Ð½Ð°Ð·Ð²Ð°Ð½Ð¸Ñ
+            # Extract region from name
             region = self._extract_region(name)
             
             return Wine(
@@ -289,11 +289,11 @@ class ConsumParser:
             return None
     
     def _extract_region(self, name: str) -> Optional[str]:
-        """Ð˜Ð·Ð²Ð»ÐµÑ‡ÐµÐ½Ð¸Ðµ Ñ€ÐµÐ³Ð¸Ð¾Ð½Ð° DO Ð¸Ð· Ð½Ð°Ð·Ð²Ð°Ð½Ð¸Ñ"""
+        """Extract DO region from name"""
         regions = [
-            "Rioja", "Ribera del Duero", "Rueda", "RÃ­as Baixas",
-            "Priorat", "PenedÃ¨s", "Jumilla", "Toro", "Navarra",
-            "La Mancha", "ValdepeÃ±as", "Utiel-Requena", "CariÃ±ena"
+            "Rioja", "Ribera del Duero", "Rueda", "Rías Baixas",
+            "Priorat", "Penedès", "Jumilla", "Toro", "Navarra",
+            "La Mancha", "Valdepeñas", "Utiel-Requena", "Cariñena"
         ]
         name_lower = name.lower()
         for region in regions:
@@ -302,7 +302,7 @@ class ConsumParser:
         return None
     
     def _extract_wine_type(self, name: str) -> Optional[str]:
-        """Ð˜Ð·Ð²Ð»ÐµÑ‡ÐµÐ½Ð¸Ðµ Ñ‚Ð¸Ð¿Ð° Ð²Ð¸Ð½Ð° Ð¸Ð· Ð½Ð°Ð·Ð²Ð°Ð½Ð¸Ñ"""
+        """Extract wine type from name"""
         name_lower = name.lower()
         if "tinto" in name_lower:
             return WineType.TINTO.value
@@ -319,14 +319,14 @@ class ConsumParser:
 
 class MercadonaParser:
     """
-    ÐŸÐ°Ñ€ÑÐµÑ€ Ð´Ð»Ñ tienda.mercadona.es
-    Ð˜ÑÐ¿Ð¾Ð»ÑŒÐ·ÑƒÐµÑ‚ Algolia API Ñ Ð¿Ñ€Ð¸Ð²ÑÐ·ÐºÐ¾Ð¹ Ðº ÑÐºÐ»Ð°Ð´Ñƒ (warehouse)
+    Parser for tienda.mercadona.es
+    Uses Algolia API with warehouse binding
     """
     
     ALGOLIA_APP_ID = "7UZJKL1DJ0"
     ALGOLIA_API_KEY = "9d8f2e39e90df472b4f2e559a116fe17"
     
-    # Ð¡ÐºÐ»Ð°Ð´Ñ‹ Ð¿Ð¾ Ñ€ÐµÐ³Ð¸Ð¾Ð½Ð°Ð¼ (Ð¸Ð· URL Ð¸Ð½Ð´ÐµÐºÑÐ° products_prod_XXX_es)
+    # Warehouses by region (from URL index products_prod_XXX_es)
     WAREHOUSES = {
         "valencia": "vlc1",
         "madrid": "mad1",
@@ -348,7 +348,7 @@ class MercadonaParser:
         })
     
     def search_wines(self, wine_type: WineType = WineType.TINTO, limit: int = 50) -> list[Wine]:
-        """ÐŸÐ¾Ð¸ÑÐº Ð²Ð¸Ð½ Ð¿Ð¾ Ñ‚Ð¸Ð¿Ñƒ"""
+        """Search wines by type"""
         query = f"vino {wine_type.value}"
         
         payload = {
@@ -377,18 +377,18 @@ class MercadonaParser:
             return []
     
     def _parse_hit(self, hit: dict) -> Optional[Wine]:
-        """ÐŸÐ°Ñ€ÑÐ¸Ð½Ð³ Ñ€ÐµÐ·ÑƒÐ»ÑŒÑ‚Ð°Ñ‚Ð° Algolia Ð² Ð¾Ð±ÑŠÐµÐºÑ‚ Wine"""
+        """Unified wine data structure"""
         try:
             product_id = str(hit.get("id", ""))
             name = hit.get("display_name", "")
             brand = hit.get("brand", "")
             
-            # Ð¦ÐµÐ½Ñ‹
+            # Prices
             price_info = hit.get("price_instructions", {})
             price = float(price_info.get("unit_price", 0))
             price_per_liter = float(price_info.get("reference_price", 0))
             
-            # ÐÐºÑ†Ð¸Ñ
+            # Discount
             discount_price = None
             discount_percent = None
             previous_price = price_info.get("previous_unit_price")
@@ -400,7 +400,7 @@ class MercadonaParser:
             # URL
             url = hit.get("share_url", f"https://tienda.mercadona.es/product/{product_id}")
             
-            # Ð˜Ð·Ð¾Ð±Ñ€Ð°Ð¶ÐµÐ½Ð¸Ðµ
+            # Image
             image_url = hit.get("thumbnail", "")
             
             return Wine(
@@ -412,7 +412,7 @@ class MercadonaParser:
                 store=Store.MERCADONA.value,
                 url=url,
                 image_url=image_url,
-                ean=None,  # Mercadona Ð½Ðµ Ð²Ð¾Ð·Ð²Ñ€Ð°Ñ‰Ð°ÐµÑ‚ EAN
+                # EAN code
                 region=self._extract_region(name),
                 wine_type=self._extract_wine_type(name),
                 discount_price=discount_price,
@@ -423,11 +423,11 @@ class MercadonaParser:
             return None
     
     def _extract_region(self, name: str) -> Optional[str]:
-        """Ð˜Ð·Ð²Ð»ÐµÑ‡ÐµÐ½Ð¸Ðµ Ñ€ÐµÐ³Ð¸Ð¾Ð½Ð° DO Ð¸Ð· Ð½Ð°Ð·Ð²Ð°Ð½Ð¸Ñ"""
+        """Extract DO region from name"""
         regions = [
-            "Rioja", "Ribera del Duero", "Rueda", "RÃ­as Baixas",
-            "Priorat", "PenedÃ¨s", "Jumilla", "Toro", "Navarra",
-            "La Mancha", "ValdepeÃ±as", "Utiel-Requena", "CariÃ±ena"
+            "Rioja", "Ribera del Duero", "Rueda", "Rías Baixas",
+            "Priorat", "Penedès", "Jumilla", "Toro", "Navarra",
+            "La Mancha", "Valdepeñas", "Utiel-Requena", "Cariñena"
         ]
         name_lower = name.lower()
         for region in regions:
@@ -436,7 +436,7 @@ class MercadonaParser:
         return None
     
     def _extract_wine_type(self, name: str) -> Optional[str]:
-        """Ð˜Ð·Ð²Ð»ÐµÑ‡ÐµÐ½Ð¸Ðµ Ñ‚Ð¸Ð¿Ð° Ð²Ð¸Ð½Ð° Ð¸Ð· Ð½Ð°Ð·Ð²Ð°Ð½Ð¸Ñ"""
+        """Extract wine type from name"""
         name_lower = name.lower()
         if "tinto" in name_lower:
             return WineType.TINTO.value
@@ -524,7 +524,7 @@ class DIAParser:
 
 class WineAggregator:
     """
-    ÐÐ³Ñ€ÐµÐ³Ð°Ñ‚Ð¾Ñ€ Ð²Ð¸Ð½ Ð¸Ð· Ð²ÑÐµÑ… Ð¼Ð°Ð³Ð°Ð·Ð¸Ð½Ð¾Ð²
+    Wine aggregator from all stores
     """
     
     def __init__(self, postal_code: str = "46001"):
@@ -563,16 +563,16 @@ class WineAggregator:
         prefer_discount: bool = True
     ) -> list[Wine]:
         """
-        ÐŸÐ¾Ð»ÑƒÑ‡ÐµÐ½Ð¸Ðµ Ñ€ÐµÐºÐ¾Ð¼ÐµÐ½Ð´Ð°Ñ†Ð¸Ð¹ Ñ Ñ„Ð¸Ð»ÑŒÑ‚Ñ€Ð°Ñ†Ð¸ÐµÐ¹
+        Get recommendations with filtering
         """
         wines = self.search_all(wine_type, limit_per_store=50)
         
-        # Ð¤Ð¸Ð»ÑŒÑ‚Ñ€ Ð¿Ð¾ Ñ†ÐµÐ½Ðµ
+        # Filter by price
         filtered = [w for w in wines if w.price <= max_price]
         
-        # Ð¡Ð¾Ñ€Ñ‚Ð¸Ñ€Ð¾Ð²ÐºÐ°
+        # Sort
         if prefer_discount:
-            # Ð¡Ð½Ð°Ñ‡Ð°Ð»Ð° ÑÐ¾ ÑÐºÐ¸Ð´ÐºÐ¾Ð¹, Ð¿Ð¾Ñ‚Ð¾Ð¼ Ð¿Ð¾ Ñ†ÐµÐ½Ðµ
+            # Discounts first, then by price
             filtered.sort(key=lambda w: (
                 0 if w.discount_price else 1,
                 w.price
@@ -584,12 +584,12 @@ class WineAggregator:
 
 
 def main():
-    """Ð”ÐµÐ¼Ð¾Ð½ÑÑ‚Ñ€Ð°Ñ†Ð¸Ñ Ñ€Ð°Ð±Ð¾Ñ‚Ñ‹ Ð¿Ð°Ñ€ÑÐµÑ€Ð¾Ð²"""
+    """Demo of parsers"""
     print("ðŸ· Wine Parser PoC\n")
     
     aggregator = WineAggregator(postal_code="46001")
     
-    # ÐŸÐ¾Ð¸ÑÐº ÐºÑ€Ð°ÑÐ½Ñ‹Ñ… Ð²Ð¸Ð½ Ð´Ð¾ 10â‚¬
+    # Search red wines under 10€
     print("Searching for red wines under 10â‚¬...\n")
     wines = aggregator.get_recommendations(
         wine_type=WineType.TINTO,
