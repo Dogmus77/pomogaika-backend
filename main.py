@@ -668,19 +668,99 @@ async def get_stores():
             {
                 "id": "masymas",
                 "name": "Masymas",
-                "has_ean": False,
-                "coverage": "Valencia, Alicante, Murcia",
-                "status": "stub"
+                "has_ean": True,
+                "coverage": "Valencia, Alicante, Murcia"
             },
             {
                 "id": "dia",
                 "name": "DIA",
                 "has_ean": False,
-                "coverage": "Toda España",
-                "status": "stub"
+                "coverage": "Toda España"
             }
         ]
     }
+
+
+@app.get("/debug/store/{store_name}")
+async def debug_store(store_name: str):
+    """Debug endpoint: test individual store parser"""
+    import traceback
+    
+    result = {
+        "store": store_name,
+        "status": "unknown",
+        "wines_count": 0,
+        "error": None,
+        "sample_wines": [],
+        "raw_response_info": None,
+    }
+    
+    try:
+        if store_name == "masymas":
+            from wine_parser import MasymasParser, WineType
+            parser = MasymasParser()
+            
+            # Test raw HTTP request first
+            import requests as req
+            raw_resp = req.get(
+                "https://tienda.masymas.com/api/rest/V1.0/catalog/searcher/products",
+                params={"q": "vino tinto", "limit": "3", "showProducts": "true", "showRecommendations": "false", "showRecipes": "false"},
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                    "Accept": "application/json",
+                    "Referer": "https://tienda.masymas.com/es",
+                },
+                timeout=15
+            )
+            result["raw_response_info"] = {
+                "status_code": raw_resp.status_code,
+                "content_type": raw_resp.headers.get("content-type"),
+                "body_length": len(raw_resp.text),
+                "body_preview": raw_resp.text[:500],
+            }
+            
+            wines = parser.search_wines(WineType.TINTO, limit=5)
+            result["wines_count"] = len(wines)
+            result["sample_wines"] = [
+                {"name": w.name, "price": w.price, "brand": w.brand, "region": w.region}
+                for w in wines[:3]
+            ]
+            result["status"] = "ok" if wines else "empty"
+            
+        elif store_name == "dia":
+            from wine_parser import DIAParser, WineType
+            parser = DIAParser()
+            wines = parser.search_wines(WineType.TINTO, limit=5)
+            result["wines_count"] = len(wines)
+            result["sample_wines"] = [
+                {"name": w.name, "price": w.price, "brand": w.brand, "region": w.region}
+                for w in wines[:3]
+            ]
+            result["status"] = "ok" if wines else "empty"
+            
+        elif store_name == "consum":
+            from wine_parser import ConsumParser, WineType
+            parser = ConsumParser()
+            wines = parser.search_wines(WineType.TINTO, limit=5)
+            result["wines_count"] = len(wines)
+            result["status"] = "ok" if wines else "empty"
+            
+        elif store_name == "mercadona":
+            from wine_parser import MercadonaParser, WineType
+            parser = MercadonaParser()
+            wines = parser.search_wines(WineType.TINTO, limit=5)
+            result["wines_count"] = len(wines)
+            result["status"] = "ok" if wines else "empty"
+            
+        else:
+            result["error"] = f"Unknown store: {store_name}"
+            
+    except Exception as e:
+        result["status"] = "error"
+        result["error"] = f"{type(e).__name__}: {str(e)}"
+        result["traceback"] = traceback.format_exc()
+    
+    return result
 
 
 if __name__ == "__main__":
