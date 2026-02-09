@@ -104,14 +104,14 @@ class ConsumParser:
                 if wine:
                     wines.append(wine)
             
-            print(f"âœ… Consum: {len(wines)} wines (from {len(products)} products)")
+            print(f"✅ Consum: {len(wines)} wines (from {len(products)} products)")
             return wines
             
         except requests.RequestException as e:
-            print(f"âŒ Consum API error: {e}")
+            print(f"❌ Consum API error: {e}")
             return []
         except Exception as e:
-            print(f"âŒ Consum parsing error: {e}")
+            print(f"❌ Consum parsing error: {e}")
             return []
     
     def _safe_get(self, data, key, default=None):
@@ -369,11 +369,11 @@ class MercadonaParser:
                 if wine:
                     wines.append(wine)
             
-            print(f"âœ… Mercadona: {len(wines)} wines (from {len(hits)} hits)")
+            print(f"✅ Mercadona: {len(wines)} wines (from {len(hits)} hits)")
             return wines
             
         except requests.RequestException as e:
-            print(f"âŒ Mercadona API error: {e}")
+            print(f"❌ Mercadona API error: {e}")
             return []
     
     def _parse_hit(self, hit: dict) -> Optional[Wine]:
@@ -585,32 +585,32 @@ class WineAggregator:
 
 def main():
     """Demo of parsers"""
-    print("ðŸ· Wine Parser PoC\n")
+    print("🍷 Wine Parser PoC\n")
     
     aggregator = WineAggregator(postal_code="46001")
     
     # Search red wines under 10€
-    print("Searching for red wines under 10â‚¬...\n")
+    print("Searching for red wines under 10€...\n")
     wines = aggregator.get_recommendations(
         wine_type=WineType.TINTO,
         max_price=10.0,
         prefer_discount=True
     )
     
-    print(f"\nðŸ“Š Found {len(wines)} wines:\n")
+    print(f"\n📊 Found {len(wines)} wines:\n")
     
     for i, wine in enumerate(wines[:10], 1):
         discount_info = ""
         if wine.discount_price:
-            discount_info = f" (ðŸ·ï¸ {wine.discount_price}â‚¬, -{wine.discount_percent}%)"
+            discount_info = f" (🏷️ {wine.discount_price}€, -{wine.discount_percent}%)"
         
         region_info = f" [{wine.region}]" if wine.region else ""
         ean_info = f" EAN:{wine.ean}" if wine.ean else ""
         
         print(f"{i}. {wine.name}")
-        print(f"   ðŸ’° {wine.price}â‚¬{discount_info} | {wine.price_per_liter}â‚¬/L")
-        print(f"   ðŸª {wine.store.upper()}{region_info}{ean_info}")
-        print(f"   ðŸ”— {wine.url}\n")
+        print(f"   💰 {wine.price}€{discount_info} | {wine.price_per_liter}€/L")
+        print(f"   🏪 {wine.store.upper()}{region_info}{ean_info}")
+        print(f"   🔗 {wine.url}\n")
 
 
 if __name__ == "__main__":
