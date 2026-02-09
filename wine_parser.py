@@ -36,7 +36,7 @@ class Wine:
     store: str
     url: str
     image_url: Optional[str] = None
-    # Consum only
+    ean: Optional[str] = None  # Consum only
     region: Optional[str] = None  # DO Rioja, Ribera del Duero, etc.
     wine_type: Optional[str] = None
     discount_price: Optional[float] = None
