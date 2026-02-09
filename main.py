@@ -1,6 +1,6 @@
 """
 Pomogaika Wine API
-Production-ready backend with real store data and multi-language support
+Production-ready backend with real store data
 """
 
 from fastapi import FastAPI, Query, HTTPException
@@ -11,13 +11,13 @@ import uvicorn
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
-from sommelier import SommelierEngine, translate
+from sommelier import SommelierEngine
 from wine_parser import WineAggregator, WineType, Wine as ParserWine
 
 app = FastAPI(
     title="Pomogaika Wine API",
     description="Wine pairing API with real data from Consum & Mercadona",
-    version="2.1.0"
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -66,7 +66,7 @@ class RecommendationResponse(BaseModel):
     recommended_grapes: list[str]
     recommended_regions: list[str]
     wines: list[WineResponse]
-    data_source: str  # "live" or "cache"
+    data_source: str  # "live" Ð¸Ð»Ð¸ "cache"
 
 
 class ExpertRecommendation(BaseModel):
@@ -147,8 +147,8 @@ async def get_wines(postal_code: str = "46001") -> list[WineResponse]:
 async def root():
     return {
         "name": "Pomogaika Wine API",
-        "version": "2.1.0",
-        "stores": ["Consum", "Mercadona"],
+        "version": "2.0.0",
+        "stores": ["Consum", "Mercadona", "Masymas", "DIA"],
         "endpoints": ["/recommend", "/search", "/expert", "/health"]
     }
 
@@ -173,12 +173,11 @@ def import_time():
 async def get_expert_recommendations(
     dish: str = Query(..., description="fish, meat, poultry, vegetables, pasta, cheese"),
     cooking_method: Optional[str] = Query(None, description="raw, steamed, grilled, fried, roasted, stewed, creamy, tomato, spicy"),
-    meal_time: Optional[str] = Query(None, description="lunch, dinner, aperitivo, digestivo"),
-    cuisine: Optional[str] = Query(None, description="spanish, italian, asian, other"),
-    lang: str = Query("en", description="Language: ru, uk, be, en, es")
+    meal_time: Optional[str] = Query(None, description="lunch, dinner, aperitivo"),
+    cuisine: Optional[str] = Query(None, description="spanish, italian, asian, indian, mediterranean, bbq")
 ):
-    """Get sommelier expert recommendations (localized)"""
-    recs = sommelier.get_recommendations(dish, cooking_method, meal_time, cuisine, lang=lang)
+    """Get sommelier expert recommendations"""
+    recs = sommelier.get_recommendations(dish, cooking_method, meal_time, cuisine)
     
     return [
         ExpertRecommendation(
@@ -196,19 +195,18 @@ async def get_expert_recommendations(
 @app.get("/recommend", response_model=RecommendationResponse)
 async def recommend_wines(
     dish: str = Query(..., description="Dish type: fish, meat, poultry, vegetables, pasta, cheese"),
-    cooking_method: Optional[str] = Query(None, description="Cooking method"),
-    meal_time: Optional[str] = Query(None, description="Meal time: lunch, dinner, aperitivo, digestivo"),
-    cuisine: Optional[str] = Query(None, description="Cuisine type"),
+    cooking_method: Optional[str] = Query(None, description="Cooking method: raw, steamed, grilled, fried, roasted, stewed, creamy, tomato, spicy"),
+    meal_time: Optional[str] = Query(None, description="Meal time: lunch, dinner, aperitivo"),
+    cuisine: Optional[str] = Query(None, description="Cuisine type: spanish, italian, asian, indian, mediterranean, bbq"),
     min_price: float = Query(0, description="Minimum price"),
     max_price: float = Query(30.0, description="Maximum price"),
     postal_code: str = Query("46001", description="Postal code"),
-    limit: int = Query(15, description="Number of results"),
-    lang: str = Query("en", description="Language: ru, uk, be, en, es")
+    limit: int = Query(15, description="Number of results")
 ):
-    """Get wine recommendations with real store data (localized)"""
+    """Get wine recommendations with real store data"""
     
-    # 1. Get expert recommendations (already translated via lang)
-    expert_recs = sommelier.get_recommendations(dish, cooking_method, meal_time, cuisine, lang=lang)
+    # 1. Get expert recommendations
+    expert_recs = sommelier.get_recommendations(dish, cooking_method, meal_time, cuisine)
     
     if not expert_recs:
         raise HTTPException(status_code=400, detail="Could not find recommendations")
@@ -229,20 +227,24 @@ async def recommend_wines(
     def score_wine(wine: WineResponse) -> int:
         score = 50
         
+        # +20 for region match
         if wine.region:
             for region in primary_rec.regions:
                 if region.lower() in wine.region.lower():
                     score += 20
                     break
         
+        # +15 for grape match in name
         for grape in primary_rec.grape_varieties:
             if grape.lower() in wine.name.lower():
                 score += 15
                 break
         
+        # +10 for discount
         if wine.discount_price:
             score += 10
         
+        # +5 for having region (quality)
         if wine.region:
             score += 5
         
@@ -252,14 +254,14 @@ async def recommend_wines(
     scored_wines = []
     for wine in filtered:
         wine.match_score = score_wine(wine)
-        wine.expert_note = get_expert_note(wine, primary_rec, lang)
+        wine.expert_note = get_expert_note(wine, primary_rec)
         scored_wines.append(wine)
     
     scored_wines.sort(key=lambda w: w.match_score or 0, reverse=True)
     
     return RecommendationResponse(
         total=len(scored_wines),
-        expert_summary=primary_rec.description,  # already translated by sommelier
+        expert_summary=primary_rec.description,
         recommended_style=primary_rec.style.value,
         recommended_grapes=primary_rec.grape_varieties,
         recommended_regions=primary_rec.regions,
@@ -268,33 +270,32 @@ async def recommend_wines(
     )
 
 
-def get_expert_note(wine: WineResponse, rec, lang: str = "en") -> str:
-    """Generate expert tasting note (localized)"""
-    note = "Excellent choice for your dish"
-    
+def get_expert_note(wine: WineResponse, rec) -> str:
+    """Generate expert tasting note"""
     if wine.region:
         if "Rioja" in wine.region:
-            note = "Classic Rioja - balance of fruit and oak"
+            return "Classic Rioja - balance of fruit and oak"
         elif "Ribera" in wine.region:
-            note = "Ribera del Duero - intensity and depth"
-        elif "Rías Baixas" in wine.region or "Rias Baixas" in wine.region:
-            note = "Albarino from Galicia - ocean minerality"
+            return "Ribera del Duero - intensity and depth"
+        elif "RÃ­as Baixas" in wine.region:
+            return "Albarino from Galicia - ocean minerality"
         elif "Rueda" in wine.region:
-            note = "Verdejo - herbs and citrus"
+            return "Verdejo - herbs and citrus"
         elif "Priorat" in wine.region:
-            note = "Priorat - power and concentration"
+            return "Priorat - power and concentration"
         elif "Jumilla" in wine.region:
-            note = "Monastrell - prune and spice"
+            return "Monastrell - prune and spice"
         elif "Bierzo" in wine.region:
-            note = "Mencia - elegance of Bierzo"
+            return "Mencia - elegance of Bierzo"
         elif "Navarra" in wine.region:
-            note = "Navarra - capital of rose wines"
-        elif "Penedès" in wine.region or "Penedes" in wine.region:
-            note = "Penedes - home of Spanish Cava"
-    elif wine.wine_type == "cava":
-        note = "Spanish sparkling - celebration in a glass"
+            return "Navarra - capital of rose wines"
+        elif "PenedÃ¨s" in wine.region:
+            return "Penedes - home of Spanish Cava"
     
-    return translate(note, lang)
+    if wine.wine_type == "cava":
+        return "Spanish sparkling - celebration in a glass"
+    
+    return "Excellent choice for your dish"
 
 
 @app.get("/search")
@@ -313,6 +314,7 @@ async def search_wines(
     all_wines = await get_wines(postal_code)
     filtered = all_wines
     
+    # Filters
     if query:
         query_lower = query.lower()
         filtered = [w for w in filtered if query_lower in w.name.lower() or query_lower in (w.brand or "").lower()]
@@ -327,7 +329,10 @@ async def search_wines(
     if store:
         filtered = [w for w in filtered if w.store == store]
     
+    # Price
     filtered = [w for w in filtered if min_price <= (w.discount_price or w.price) <= max_price]
+    
+    # Sort by price
     filtered.sort(key=lambda w: w.discount_price or w.price)
     
     return {
@@ -345,13 +350,27 @@ async def get_stores():
                 "id": "consum",
                 "name": "Consum",
                 "has_ean": True,
-                "coverage": "Valencia, Cataluña, Murcia, Castilla-La Mancha"
+                "coverage": "Valencia, CataluÃ±a, Murcia, Castilla-La Mancha"
             },
             {
                 "id": "mercadona",
                 "name": "Mercadona",
                 "has_ean": False,
-                "coverage": "Toda España"
+                "coverage": "Toda EspaÃ±a"
+            },
+            {
+                "id": "masymas",
+                "name": "Masymas",
+                "has_ean": False,
+                "coverage": "Valencia, Alicante, Murcia",
+                "status": "stub"
+            },
+            {
+                "id": "dia",
+                "name": "DIA",
+                "has_ean": False,
+                "coverage": "Toda EspaÃ±a",
+                "status": "stub"
             }
         ]
     }
