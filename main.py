@@ -612,7 +612,7 @@ async def search_wines(
     region: Optional[str] = Query(None, description="DO Region"),
     min_price: float = Query(0, description="Minimum price"),
     max_price: float = Query(100.0, description="Maximum price"),
-    store: Optional[str] = Query(None, description="consum, mercadona"),
+    store: Optional[str] = Query(None, description="consum, mercadona, masymas, dia"),
     postal_code: str = Query("46001", description="Postal code"),
     limit: int = Query(30, description="Number of results")
 ):
