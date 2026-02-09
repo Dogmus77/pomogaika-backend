@@ -30,13 +30,32 @@ app.add_middleware(
 
 # Initialization
 sommelier = SommelierEngine()
-executor = ThreadPoolExecutor(max_workers=4)
+executor = ThreadPoolExecutor(max_workers=8)
 
 # Wine cache (updates every 30 minutes)
 wine_cache = {
     "wines": [],
-    "last_update": None
+    "last_update": None,
+    "is_loading": False
 }
+
+
+# === Startup: pre-warm cache ===
+
+@app.on_event("startup")
+async def startup_warmup():
+    """Pre-warm wine cache on server start"""
+    print("🚀 Starting cache warmup...")
+    asyncio.create_task(_warmup_cache())
+
+
+async def _warmup_cache():
+    """Background task to fill cache"""
+    try:
+        await get_wines("46001")
+        print(f"🔥 Cache warmed: {len(wine_cache['wines'])} wines ready")
+    except Exception as e:
+        print(f"⚠️ Cache warmup failed: {e}")
 
 
 # === Models ===
@@ -81,17 +100,18 @@ class ExpertRecommendation(BaseModel):
 # === Wine Fetching ===
 
 def fetch_wines_sync(postal_code: str = "46001") -> list[ParserWine]:
-    """Sync fetch wines from stores"""
+    """Sync fetch wines from stores — ALL types in parallel"""
+    import time
+    start = time.time()
+    
     aggregator = WineAggregator(postal_code=postal_code)
-    all_wines = []
+    all_wines = aggregator.search_all_types(
+        wine_types=[WineType.TINTO, WineType.BLANCO, WineType.ROSADO, WineType.CAVA],
+        limit_per_store=30
+    )
     
-    for wine_type in [WineType.TINTO, WineType.BLANCO, WineType.ROSADO, WineType.CAVA]:
-        try:
-            wines = aggregator.search_all(wine_type, limit_per_store=30)
-            all_wines.extend(wines)
-        except Exception as e:
-            print(f"Error fetching {wine_type.value}: {e}")
-    
+    elapsed = time.time() - start
+    print(f"⏱️ fetch_wines_sync: {len(all_wines)} wines in {elapsed:.1f}s")
     return all_wines
 
 
@@ -101,8 +121,17 @@ async def get_wines(postal_code: str = "46001") -> list[WineResponse]:
     
     # Check cache (30 min)
     if wine_cache["wines"] and wine_cache["last_update"]:
-        if time.time() - wine_cache["last_update"] < 1800:  # 30 min
+        age = time.time() - wine_cache["last_update"]
+        if age < 1800:  # 30 min
             return wine_cache["wines"]
+        print(f"♻️ Cache expired ({age:.0f}s old), refreshing...")
+    
+    # Prevent multiple simultaneous fetches
+    if wine_cache["is_loading"]:
+        print("⏳ Already loading, returning current cache")
+        return wine_cache["wines"]
+    
+    wine_cache["is_loading"] = True
     
     # Get fresh data
     loop = asyncio.get_event_loop()
@@ -130,15 +159,18 @@ async def get_wines(postal_code: str = "46001") -> list[WineResponse]:
         # Update cache
         wine_cache["wines"] = wines
         wine_cache["last_update"] = time.time()
+        print(f"✅ Cache updated: {len(wines)} wines")
         
         return wines
         
     except Exception as e:
-        print(f"Error fetching wines: {e}")
+        print(f"❌ Error fetching wines: {e}")
         # Return cache if available
         if wine_cache["wines"]:
             return wine_cache["wines"]
         return []
+    finally:
+        wine_cache["is_loading"] = False
 
 
 # === Endpoints ===
@@ -155,18 +187,21 @@ async def root():
 
 @app.get("/health")
 async def health():
+    import time
+    cache_age = int(time.time() - wine_cache["last_update"]) if wine_cache["last_update"] else -1
+    
+    # Count wines per store
+    store_counts = {}
+    for w in wine_cache["wines"]:
+        store_counts[w.store] = store_counts.get(w.store, 0) + 1
+    
     return {
         "status": "ok",
         "cache_size": len(wine_cache["wines"]),
-        "cache_age_seconds": int(
-            (import_time() - wine_cache["last_update"]) if wine_cache["last_update"] else 0
-        )
+        "cache_age_seconds": cache_age,
+        "is_loading": wine_cache["is_loading"],
+        "stores": store_counts
     }
-
-
-def import_time():
-    import time
-    return time.time()
 
 
 @app.get("/expert", response_model=list[ExpertRecommendation])
