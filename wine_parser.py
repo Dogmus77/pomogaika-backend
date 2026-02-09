@@ -455,19 +455,22 @@ class MasymasParser:
     """
     Parser for tienda.masymas.com
     Regional chain: Valencia, Alicante, Murcia
+    Uses Aktios Digital Services platform with REST API.
     
-    TODO: Reverse-engineer internal API via browser DevTools
-    The site is a JavaScript SPA using aktiosdigitalservices.com CDN.
-    Need to capture XHR requests to find product search endpoint.
+    API endpoint: /api/rest/V1.0/catalog/searcher/products
+    No auth required — public search API.
     
-    Steps to implement:
-    1. Open tienda.masymas.com in Chrome DevTools → Network tab
-    2. Search for "vino" and capture API calls
-    3. Identify auth headers / session tokens needed
-    4. Implement search_wines() with real API calls
+    Product structure:
+      catalog.products[].id, .ean, .productData.name, .productData.brand.name,
+      .productData.imageURL, .productData.url,
+      .priceData.prices[{id:"PRICE", value:{centAmount, centUnitAmount}}]
+      .priceData.prices[{id:"OFFER_PRICE", ...}]  (if discounted)
+      .offers[] (promotion details)
+      .categories[].name  (e.g. "D.O. Rioja", "Vino tinto de mesa")
     """
     
     BASE_URL = "https://tienda.masymas.com"
+    API_URL = "https://tienda.masymas.com/api/rest/V1.0/catalog/searcher/products"
     
     def __init__(self, postal_code: str = "46001"):
         self.postal_code = postal_code
@@ -475,15 +478,167 @@ class MasymasParser:
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)",
             "Accept": "application/json",
+            "Accept-Language": "es-ES,es;q=0.9",
         })
     
     def search_wines(self, wine_type: WineType = WineType.TINTO, limit: int = 50) -> list[Wine]:
-        """Search wines — stub, returns empty until API is reverse-engineered"""
-        print(f"⚠️ Masymas: parser not yet implemented (stub)")
-        # TODO: implement real API calls
-        # Expected endpoint pattern: https://tienda.masymas.com/api/...
-        # or proxied via aktiosdigitalservices.com
-        return []
+        """Search wines by type via Masymas REST API"""
+        query = f"vino {wine_type.value}"
+        
+        params = {
+            "q": query,
+            "limit": min(limit, 40),  # API max is 40 per request
+            "showRecommendations": "false",
+            "showProducts": "true",
+            "showRecipes": "false",
+        }
+        
+        try:
+            response = self.session.get(self.API_URL, params=params, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+            
+            wines = []
+            catalog = data.get("catalog", {})
+            products = catalog.get("products", [])
+            
+            for item in products:
+                wine = self._parse_product(item, wine_type)
+                if wine:
+                    wines.append(wine)
+            
+            print(f"✅ Masymas: {len(wines)} wines (from {len(products)} products)")
+            return wines
+            
+        except requests.RequestException as e:
+            print(f"❌ Masymas API error: {e}")
+            return []
+        except Exception as e:
+            print(f"❌ Masymas parsing error: {e}")
+            return []
+    
+    def _parse_product(self, item: dict, search_type: WineType) -> Optional[Wine]:
+        """Parse Masymas API product into Wine object"""
+        try:
+            product_id = str(item.get("id", ""))
+            ean = str(item.get("ean", "")) or None
+            
+            product_data = item.get("productData", {})
+            if not isinstance(product_data, dict):
+                return None
+            
+            name = str(product_data.get("name", ""))
+            if not name:
+                return None
+            
+            # Brand
+            brand_data = product_data.get("brand", {})
+            brand = brand_data.get("name", "") if isinstance(brand_data, dict) else str(brand_data)
+            
+            # Prices
+            price_data = item.get("priceData", {})
+            prices = price_data.get("prices", []) if isinstance(price_data, dict) else []
+            
+            price = 0.0
+            price_per_liter = 0.0
+            discount_price = None
+            discount_percent = None
+            
+            for p in prices:
+                if not isinstance(p, dict):
+                    continue
+                pid = p.get("id", "")
+                value = p.get("value", {})
+                if not isinstance(value, dict):
+                    continue
+                    
+                if pid == "PRICE":
+                    price = float(value.get("centAmount", 0) or 0)
+                    price_per_liter = float(value.get("centUnitAmount", 0) or 0)
+                elif pid == "OFFER_PRICE":
+                    discount_price = float(value.get("centAmount", 0) or 0)
+            
+            if price == 0:
+                return None
+            
+            # Calculate discount percent
+            if discount_price and discount_price > 0 and price > discount_price:
+                discount_percent = int((1 - discount_price / price) * 100)
+            
+            # URL and image
+            product_url = product_data.get("url", "")
+            if not product_url:
+                product_url = f"{self.BASE_URL}/es/p/{product_id}"
+            
+            image_url = product_data.get("imageURL", "")
+            
+            # Region from categories
+            region = None
+            categories = item.get("categories", [])
+            for cat in categories:
+                cat_name = cat.get("name", "") if isinstance(cat, dict) else ""
+                if "D.O." in cat_name or "D.o." in cat_name:
+                    # Extract DO name: "D.O. Rioja" -> "Rioja"
+                    region = cat_name.replace("D.O. ", "").replace("D.o. ", "").strip()
+                    break
+            
+            # Fallback: extract region from name
+            if not region:
+                region = self._extract_region(name)
+            
+            # Wine type from name or search context
+            wine_type = self._extract_wine_type(name)
+            if not wine_type:
+                wine_type = search_type.value
+            
+            return Wine(
+                id=f"masymas_{product_id}",
+                name=name,
+                brand=brand,
+                price=price,
+                price_per_liter=price_per_liter,
+                store=Store.MASYMAS.value,
+                url=product_url,
+                image_url=image_url or None,
+                ean=ean,
+                region=region,
+                wine_type=wine_type,
+                discount_price=discount_price,
+                discount_percent=discount_percent,
+            )
+        except Exception as e:
+            print(f"Error parsing Masymas product: {e}")
+            return None
+    
+    def _extract_region(self, name: str) -> Optional[str]:
+        """Extract DO region from wine name"""
+        regions = [
+            "Rioja", "Ribera del Duero", "Rueda", "Rías Baixas",
+            "Priorat", "Penedès", "Jumilla", "Toro", "Navarra",
+            "La Mancha", "Valdepeñas", "Utiel-Requena", "Cariñena",
+            "Somontano", "Campo de Borja", "Bierzo", "Yecla",
+            "Valdeorras", "Alicante", "Valencia",
+        ]
+        name_lower = name.lower()
+        for region in regions:
+            if region.lower() in name_lower:
+                return region
+        return None
+    
+    def _extract_wine_type(self, name: str) -> Optional[str]:
+        """Extract wine type from name"""
+        name_lower = name.lower()
+        if "tinto" in name_lower:
+            return WineType.TINTO.value
+        elif "blanco" in name_lower:
+            return WineType.BLANCO.value
+        elif "rosado" in name_lower:
+            return WineType.ROSADO.value
+        elif "cava" in name_lower:
+            return WineType.CAVA.value
+        elif "espumoso" in name_lower:
+            return WineType.ESPUMOSO.value
+        return None
 
 
 class DIAParser:
@@ -491,17 +646,16 @@ class DIAParser:
     Parser for dia.es
     National chain across Spain
     
-    TODO: Requires headless browser (Selenium/Playwright) or reverse-engineering
-    No public REST API available.
+    Uses server-side rendered HTML with data-test-id attributes.
+    Search endpoint: /search?q=vino+tinto
     
-    Known scraper references:
-    - github.com/vgvr0/dia-supermarket-scraper (Selenium-based)
-    - github.com/joseluam97/Supermarket-Price-Scraper
-    
-    Steps to implement:
-    1. Option A: Use Playwright/Selenium to navigate dia.es/compra-online/
-    2. Option B: Reverse-engineer XHR calls via DevTools
-    3. Parse product cards for wine data
+    Product data extracted from HTML:
+      data-test-id="search-product-card-name" — name + href (includes product ID)
+      data-test-id="search-product-card-image" — image src
+      data-test-id="search-product-card-unit-price" — price (e.g. "4,72 €")
+      data-test-id="search-product-card-kilo-price" — per-liter price (e.g. "(6,29 €/LITRO)")
+      data-test-id="product-special-offer-discount-percentage-strikethrough-price" — original price
+      data-test-id="product-special-offer-discount-percentage-discount" — discount (e.g. "25% dto.")
     """
     
     BASE_URL = "https://www.dia.es"
@@ -510,16 +664,203 @@ class DIAParser:
         self.postal_code = postal_code
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)",
-            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "es-ES,es;q=0.9",
         })
     
     def search_wines(self, wine_type: WineType = WineType.TINTO, limit: int = 50) -> list[Wine]:
-        """Search wines — stub, returns empty until scraper is implemented"""
-        print(f"⚠️ DIA: parser not yet implemented (stub)")
-        # TODO: implement via Selenium/Playwright or reverse-engineered API
-        # Category URLs: dia.es/compra-online/bebidas/vinos/...
-        return []
+        """Search wines by scraping DIA search results page"""
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            print("❌ DIA: beautifulsoup4 not installed, run: pip install beautifulsoup4")
+            return []
+        
+        query = f"vino {wine_type.value}"
+        url = f"{self.BASE_URL}/search"
+        params = {"q": query}
+        
+        try:
+            response = self.session.get(url, params=params, timeout=15)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.text, "html.parser")
+            wines = []
+            
+            # Find all product list items
+            items = soup.select('[data-test-id="search-product-card-list-item"]')
+            
+            for item in items[:limit]:
+                wine = self._parse_card(item, wine_type)
+                if wine:
+                    wines.append(wine)
+            
+            print(f"✅ DIA: {len(wines)} wines (from {len(items)} cards)")
+            return wines
+            
+        except requests.RequestException as e:
+            print(f"❌ DIA scraping error: {e}")
+            return []
+        except Exception as e:
+            print(f"❌ DIA parsing error: {e}")
+            return []
+    
+    def _parse_card(self, item, search_type: WineType) -> Optional[Wine]:
+        """Parse a DIA product card HTML element into Wine object"""
+        try:
+            # Name and URL
+            name_el = item.select_one('[data-test-id="search-product-card-name"]')
+            if not name_el:
+                return None
+            
+            name = name_el.get_text(strip=True)
+            href = name_el.get("href", "")
+            
+            if not name:
+                return None
+            
+            # Extract product ID from href: /cervezas.../p/112887
+            product_id = ""
+            if "/p/" in href:
+                product_id = href.split("/p/")[-1].strip("/")
+            
+            product_url = f"{self.BASE_URL}{href}" if href.startswith("/") else href
+            
+            # Image
+            img_el = item.select_one('[data-test-id="search-product-card-image"]')
+            image_url = None
+            if img_el:
+                img_src = img_el.get("src", "")
+                if img_src and img_src.startswith("/"):
+                    image_url = f"{self.BASE_URL}{img_src}"
+                elif img_src:
+                    image_url = img_src
+            
+            # Price
+            price_el = item.select_one('[data-test-id="search-product-card-unit-price"]')
+            price = self._parse_price(price_el.get_text(strip=True) if price_el else "")
+            
+            if price == 0:
+                return None
+            
+            # Per-liter price
+            kilo_el = item.select_one('[data-test-id="search-product-card-kilo-price"]')
+            price_per_liter = 0.0
+            if kilo_el:
+                kilo_text = kilo_el.get_text(strip=True)
+                # Format: "(6,29 €/LITRO)" or "(8,40 €/KG)"
+                price_per_liter = self._parse_price(kilo_text)
+            
+            # Discount info
+            discount_price = None
+            discount_percent = None
+            
+            strike_el = item.select_one('[data-test-id="product-special-offer-discount-percentage-strikethrough-price"]')
+            discount_el = item.select_one('[data-test-id="product-special-offer-discount-percentage-discount"]')
+            
+            if strike_el and discount_el:
+                original_price = self._parse_price(strike_el.get_text(strip=True))
+                if original_price > 0 and original_price > price:
+                    discount_price = price
+                    price = original_price  # original price becomes the main price
+                    discount_text = discount_el.get_text(strip=True)
+                    # Format: "25% dto."
+                    import re
+                    pct_match = re.search(r'(\d+)%', discount_text)
+                    if pct_match:
+                        discount_percent = int(pct_match.group(1))
+                    else:
+                        discount_percent = int((1 - discount_price / price) * 100)
+            
+            # Extract region and wine type from name
+            region = self._extract_region(name)
+            wine_type = self._extract_wine_type(name)
+            if not wine_type:
+                wine_type = search_type.value
+            
+            # Extract brand from name (first part before D.O. or type keywords)
+            brand = self._extract_brand(name)
+            
+            return Wine(
+                id=f"dia_{product_id}",
+                name=name,
+                brand=brand,
+                price=price,
+                price_per_liter=price_per_liter,
+                store=Store.DIA.value,
+                url=product_url,
+                image_url=image_url,
+                ean=None,
+                region=region,
+                wine_type=wine_type,
+                discount_price=discount_price,
+                discount_percent=discount_percent,
+            )
+        except Exception as e:
+            print(f"Error parsing DIA card: {e}")
+            return None
+    
+    def _parse_price(self, text: str) -> float:
+        """Parse Spanish price format: '4,72 €' -> 4.72"""
+        import re
+        match = re.search(r'(\d+[.,]\d+)', text)
+        if match:
+            return float(match.group(1).replace(",", "."))
+        match = re.search(r'(\d+)', text)
+        if match:
+            return float(match.group(1))
+        return 0.0
+    
+    def _extract_region(self, name: str) -> Optional[str]:
+        """Extract DO region from wine name"""
+        regions = [
+            "Rioja", "Ribera del Duero", "Rueda", "Rías Baixas",
+            "Priorat", "Penedès", "Jumilla", "Toro", "Navarra",
+            "La Mancha", "Valdepeñas", "Utiel-Requena", "Cariñena",
+            "Somontano", "Campo de Borja", "Bierzo", "Yecla",
+            "Valdeorras", "Castilla La Mancha", "Valencia", "Alicante",
+        ]
+        name_lower = name.lower()
+        for region in regions:
+            if region.lower() in name_lower:
+                return region
+        # Check for "D.O." pattern
+        import re
+        do_match = re.search(r'D\.O\.?\s+([A-Za-záéíóúñÁÉÍÓÚÑ\s]+?)(?:\s+(?:botella|brik|bag|pack)|$)', name)
+        if do_match:
+            return do_match.group(1).strip()
+        return None
+    
+    def _extract_wine_type(self, name: str) -> Optional[str]:
+        """Extract wine type from name"""
+        name_lower = name.lower()
+        if "tinto" in name_lower:
+            return WineType.TINTO.value
+        elif "blanco" in name_lower:
+            return WineType.BLANCO.value
+        elif "rosado" in name_lower:
+            return WineType.ROSADO.value
+        elif "cava" in name_lower:
+            return WineType.CAVA.value
+        elif "espumoso" in name_lower:
+            return WineType.ESPUMOSO.value
+        return None
+    
+    def _extract_brand(self, name: str) -> str:
+        """Extract brand from DIA wine name
+        Typical format: 'Vino tinto crianza D.O. Rioja Campo viejo botella 75 cl'
+        Brand is usually after the region/type: 'Campo viejo'
+        """
+        import re
+        # Remove volume info at the end
+        clean = re.sub(r'\s*(botella|brik|bag|pack)\s+\d+.*$', '', name, flags=re.IGNORECASE)
+        # Remove D.O. + region
+        clean = re.sub(r'D\.O\.?\s+[A-Za-záéíóúñÁÉÍÓÚÑ\s]+?(?=\s+[A-Z]|\s*$)', '', clean)
+        # Remove wine type descriptors at the beginning
+        clean = re.sub(r'^Vino\s+(tinto|blanco|rosado|espumoso)\s*(crianza|reserva|gran reserva|joven|roble)?\s*', '', clean, flags=re.IGNORECASE)
+        brand = clean.strip()
+        return brand if brand else name.split()[0] if name else "DIA"
 
 
 class WineAggregator:
