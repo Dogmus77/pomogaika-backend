@@ -113,7 +113,7 @@ def fetch_wines_sync(postal_code: str = "46001") -> list[ParserWine]:
     aggregator = WineAggregator(postal_code=postal_code)
     all_wines = aggregator.search_all_types(
         wine_types=[WineType.TINTO, WineType.BLANCO, WineType.ROSADO, WineType.CAVA],
-        limit_per_store=30
+        limit_per_store=80
     )
     
     elapsed = time.time() - start
