@@ -106,18 +106,30 @@ class ExpertRecommendation(BaseModel):
 # === Wine Fetching ===
 
 def fetch_wines_sync(postal_code: str = "46001") -> list[ParserWine]:
-    """Sync fetch wines from stores — ALL types in parallel"""
+    """Sync fetch wines from stores — ALL types + premium queries in parallel"""
     import time
     start = time.time()
     
     aggregator = WineAggregator(postal_code=postal_code)
+    
+    # 1. Standard search by wine type
     all_wines = aggregator.search_all_types(
         wine_types=[WineType.TINTO, WineType.BLANCO, WineType.ROSADO, WineType.CAVA],
         limit_per_store=80
     )
     
+    # 2. Premium-targeted search (reserva, gran reserva, premium regions)
+    premium_wines = aggregator.search_premium(limit_per_query=20)
+    
+    # 3. Deduplicate by ID
+    seen_ids = {w.id for w in all_wines}
+    for pw in premium_wines:
+        if pw.id not in seen_ids:
+            seen_ids.add(pw.id)
+            all_wines.append(pw)
+    
     elapsed = time.time() - start
-    print(f"⏱️ fetch_wines_sync: {len(all_wines)} wines in {elapsed:.1f}s")
+    print(f"⏱️ fetch_wines_sync: {len(all_wines)} wines ({len(premium_wines)} premium) in {elapsed:.1f}s")
     return all_wines
 
 
