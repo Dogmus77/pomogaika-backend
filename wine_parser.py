@@ -60,9 +60,9 @@ class ConsumParser:
             "Accept-Language": "es-ES,es;q=0.9",
         })
     
-    def search_wines(self, wine_type: WineType = WineType.TINTO, limit: int = 50) -> list[Wine]:
-        """Search wines by type"""
-        query = f"vino {wine_type.value}"
+    def search_wines(self, wine_type: WineType = WineType.TINTO, limit: int = 50, custom_query: str = None) -> list[Wine]:
+        """Search wines by type or custom query"""
+        query = custom_query if custom_query else f"vino {wine_type.value}"
         
         # New Consum API endpoint (changed from /catalog/product)
         url = f"{self.BASE_URL}/catalog/searcher/products"
@@ -347,9 +347,9 @@ class MercadonaParser:
             "x-algolia-application-id": self.ALGOLIA_APP_ID,
         })
     
-    def search_wines(self, wine_type: WineType = WineType.TINTO, limit: int = 50) -> list[Wine]:
-        """Search wines by type"""
-        query = f"vino {wine_type.value}"
+    def search_wines(self, wine_type: WineType = WineType.TINTO, limit: int = 50, custom_query: str = None) -> list[Wine]:
+        """Search wines by type or custom query"""
+        query = custom_query if custom_query else f"vino {wine_type.value}"
         
         payload = {
             "query": query,
@@ -483,9 +483,9 @@ class MasymasParser:
             "Origin": "https://tienda.masymas.com",
         })
     
-    def search_wines(self, wine_type: WineType = WineType.TINTO, limit: int = 50) -> list[Wine]:
+    def search_wines(self, wine_type: WineType = WineType.TINTO, limit: int = 50, custom_query: str = None) -> list[Wine]:
         """Search wines by type via Masymas REST API"""
-        query = f"vino {wine_type.value}"
+        query = custom_query if custom_query else f"vino {wine_type.value}"
         
         params = {
             "q": query,
@@ -691,7 +691,7 @@ class DIAParser:
             "Accept-Language": "es-ES,es;q=0.9",
         })
     
-    def search_wines(self, wine_type: WineType = WineType.TINTO, limit: int = 50) -> list[Wine]:
+    def search_wines(self, wine_type: WineType = WineType.TINTO, limit: int = 50, custom_query: str = None) -> list[Wine]:
         """Search wines by scraping DIA search results page"""
         try:
             from bs4 import BeautifulSoup
@@ -699,7 +699,7 @@ class DIAParser:
             print("❌ DIA: beautifulsoup4 not installed, run: pip install beautifulsoup4")
             return []
         
-        query = f"vino {wine_type.value}"
+        query = custom_query if custom_query else f"vino {wine_type.value}"
         url = f"{self.BASE_URL}/search"
         params = {"q": query}
         
@@ -960,6 +960,58 @@ class WineAggregator:
                     print(f"⚠️ {p.__class__.__name__}/{wt.value} timeout: {e}")
         
         print(f"✅ Aggregator: {len(all_wines)} total wines from {len(tasks)} tasks")
+        return all_wines
+    
+    def search_premium(self, limit_per_query: int = 20) -> list[Wine]:
+        """Search for premium wines using targeted queries across all stores.
+        Supermarket default search returns cheap wines first — these queries
+        specifically target Reserva, Gran Reserva, premium regions, etc.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        premium_queries = [
+            "vino reserva",
+            "vino gran reserva",
+            "vino crianza rioja",
+            "vino ribera del duero",
+            "vino priorat",
+            "albariño rias baixas",
+            "cava reserva",
+            "vino ecologico",
+            "vino toro",
+            "vino somontano",
+        ]
+        
+        all_wines = []
+        seen_ids = set()
+        
+        def fetch_premium(parser, q):
+            try:
+                return parser.search_wines(custom_query=q, limit=limit_per_query)
+            except Exception as e:
+                print(f"⚠️ Premium {parser.__class__.__name__}/{q}: {e}")
+                return []
+        
+        tasks = []
+        for parser in self._parsers:
+            for q in premium_queries:
+                tasks.append((parser, q))
+        
+        # Run all premium queries in parallel
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(fetch_premium, p, q): (p, q) for p, q in tasks}
+            for future in as_completed(futures, timeout=30):
+                try:
+                    wines = future.result()
+                    for w in wines:
+                        if w.id not in seen_ids:
+                            seen_ids.add(w.id)
+                            all_wines.append(w)
+                except Exception as e:
+                    p, q = futures[future]
+                    print(f"⚠️ Premium {p.__class__.__name__}/{q} timeout: {e}")
+        
+        print(f"✅ Premium search: {len(all_wines)} unique wines from {len(tasks)} queries")
         return all_wines
     
     def get_recommendations(
