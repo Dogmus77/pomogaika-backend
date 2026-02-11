@@ -128,8 +128,21 @@ def fetch_wines_sync(postal_code: str = "46001") -> list[ParserWine]:
             seen_ids.add(pw.id)
             all_wines.append(pw)
     
+    # 4. Exclude non-wine products (jamon, bread, rum, etc.)
+    _EXCLUDE_KEYWORDS = [
+        "jamon", "jam\u00F3n", "bocadillo", "bocata",
+        "ron ", "ron a\u00F1ejo", "whisky", "whiskey", "ginebra", "vodka",
+        "cerveza", "zumo", "refresco", "agua mineral",
+        "aceite", "vinagre", "queso", "chorizo", "salchich",
+        "pat\u00E9", "conserva", "lata de", "atun", "at\u00FAn",
+    ]
+    all_wines = [
+        w for w in all_wines
+        if not any(kw in w.name.lower() for kw in _EXCLUDE_KEYWORDS)
+    ]
+    
     elapsed = time.time() - start
-    print(f"⏱️ fetch_wines_sync: {len(all_wines)} wines ({len(premium_wines)} premium) in {elapsed:.1f}s")
+    print(f"\u23F1\uFE0F fetch_wines_sync: {len(all_wines)} wines ({len(premium_wines)} premium) in {elapsed:.1f}s")
     return all_wines
 
 
