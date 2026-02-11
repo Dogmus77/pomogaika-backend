@@ -711,7 +711,7 @@ async def search_wines(
     max_price: float = Query(100.0, description="Maximum price"),
     store: Optional[str] = Query(None, description="consum, mercadona, masymas, dia"),
     postal_code: str = Query("46001", description="Postal code"),
-    limit: int = Query(30, description="Number of results")
+    limit: int = Query(80, description="Number of results")
 ):
     """Search wines with filters"""
     
