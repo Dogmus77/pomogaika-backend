@@ -119,7 +119,7 @@ def fetch_wines_sync(postal_code: str = "46001") -> list[ParserWine]:
     )
     
     # 2. Premium-targeted search (reserva, gran reserva, premium regions)
-    premium_wines = aggregator.search_premium(limit_per_query=20)
+    premium_wines = aggregator.search_premium(limit_per_query=40)
     
     # 3. Deduplicate by ID
     seen_ids = {w.id for w in all_wines}
@@ -254,7 +254,7 @@ async def recommend_wines(
     min_price: float = Query(0, description="Minimum price"),
     max_price: float = Query(30.0, description="Maximum price"),
     postal_code: str = Query("46001", description="Postal code"),
-    limit: int = Query(50, description="Number of results"),
+    limit: int = Query(80, description="Number of results"),
     lang: str = Query("ru", description="Language: ru, uk, be, en, es")
 ):
     """Get wine recommendations with real store data"""
