@@ -931,8 +931,8 @@ class CondisParser:
             data = response.json()
 
             wines = []
-            content = data.get("content", {})
-            docs = content.get("docs", [])
+            catalog = data.get("catalog", {})
+            docs = catalog.get("content", [])
 
             for doc in docs:
                 wine = self._parse_doc(doc, wine_type)
@@ -1142,8 +1142,8 @@ class WineAggregator:
                 print(f"⚠️ {store_name} error: {e}")
                 return []
         
-        # Fetch all 4 stores simultaneously
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        # Fetch all 5 stores simultaneously
+        with ThreadPoolExecutor(max_workers=5) as pool:
             futures = {pool.submit(fetch_store, p): p for p in self._parsers}
             for future in as_completed(futures, timeout=20):
                 try:
