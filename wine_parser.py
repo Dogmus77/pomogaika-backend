@@ -994,19 +994,8 @@ class CondisParser:
                 if pum_match:
                     price_per_liter = float(pum_match.group(1).replace(",", "."))
 
-            # Image
-            images = doc.get("images", [])
-            image_url = None
-            if images:
-                img = images[0]
-                if img.startswith("http"):
-                    image_url = img
-                elif img.startswith("/"):
-                    image_url = f"{self.SITE_URL}{img}"
-                else:
-                    image_url = f"{self.CDN_URL}/{product_id}.jpg"
-            else:
-                image_url = f"{self.CDN_URL}/{product_id}.jpg"
+            # Image — always use CDN (site requires auth, returns 307)
+            image_url = f"{self.CDN_URL}/{product_id}.jpg"
 
             # URL
             url_path = doc.get("url", "")
