@@ -23,6 +23,7 @@ class Store(Enum):
     MERCADONA = "mercadona"
     MASYMAS = "masymas"
     DIA = "dia"
+    CONDIS = "condis"
 
 
 @dataclass
@@ -885,19 +886,247 @@ class DIAParser:
         return brand if brand else name.split()[0] if name else "DIA"
 
 
+class CondisParser:
+    """
+    Parser for compraonline.condis.es
+    Regional chain: Cataluña (Barcelona area)
+
+    Uses Empathy.co search API — public, no auth required.
+    Endpoint: https://api.staging.empathy.co/search/v1/query/condis/search
+    Store ID: 718
+
+    Product data includes: name, brand, price (regular + discounted),
+    category hierarchy with variety (D.O.), images via CDN.
+    Has product_type field for reliable wine filtering.
+    """
+
+    EMPATHY_URL = "https://api.staging.empathy.co/search/v1/query/condis/search"
+    CDN_URL = "https://cdn.condis.es/fit-in/496x436/es/products"
+    STORE_ID = "718"
+    SITE_URL = "https://compraonline.condis.es"
+
+    def __init__(self, postal_code: str = "46001"):
+        self.postal_code = postal_code
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            "Accept": "application/json",
+        })
+
+    def search_wines(self, wine_type: WineType = WineType.TINTO, limit: int = 50, custom_query: str = None) -> list[Wine]:
+        """Search wines via Empathy.co API"""
+        query = custom_query if custom_query else f"vino {wine_type.value}"
+
+        params = {
+            "query": query,
+            "lang": "es",
+            "store": self.STORE_ID,
+            "start": 0,
+            "rows": min(limit, 24),
+        }
+
+        try:
+            response = self.session.get(self.EMPATHY_URL, params=params, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+
+            wines = []
+            content = data.get("content", {})
+            docs = content.get("docs", [])
+
+            for doc in docs:
+                wine = self._parse_doc(doc, wine_type)
+                if wine:
+                    wines.append(wine)
+
+            print(f"\u2705 Condis: {len(wines)} wines (from {len(docs)} docs)")
+            return wines
+
+        except requests.RequestException as e:
+            print(f"\u274C Condis API error: {e}")
+            return []
+        except Exception as e:
+            print(f"\u274C Condis parsing error: {e}")
+            return []
+
+    def _parse_doc(self, doc: dict, search_type: WineType) -> Optional[Wine]:
+        """Parse Empathy.co search result into Wine object"""
+        try:
+            product_id = str(doc.get("id", doc.get("externalId", "")))
+            name = doc.get("description", "")
+            if not name:
+                return None
+
+            brand = doc.get("brand", "")
+
+            # Price
+            price_data = doc.get("price", {})
+            if isinstance(price_data, dict):
+                price = float(price_data.get("regular", 0) or 0)
+                current = float(price_data.get("current", 0) or 0)
+                discounted = float(price_data.get("discounted", 0) or 0)
+            else:
+                price = float(price_data or 0)
+                current = price
+                discounted = 0
+
+            if price == 0 and current > 0:
+                price = current
+            if price == 0:
+                return None
+
+            # Discount
+            discount_price = None
+            discount_percent = None
+            if discounted > 0 and discounted < price:
+                discount_price = discounted
+                discount_percent = int((1 - discounted / price) * 100)
+            elif current > 0 and current < price:
+                discount_price = current
+                discount_percent = int((1 - current / price) * 100)
+
+            # Price per liter from pum field: "9,53€/Litro"
+            price_per_liter = 0.0
+            pum = doc.get("pum", "")
+            if pum:
+                import re
+                pum_match = re.search(r'([\d,]+)', pum)
+                if pum_match:
+                    price_per_liter = float(pum_match.group(1).replace(",", "."))
+
+            # Image
+            images = doc.get("images", [])
+            image_url = None
+            if images:
+                img = images[0]
+                if img.startswith("http"):
+                    image_url = img
+                elif img.startswith("/"):
+                    image_url = f"{self.SITE_URL}{img}"
+                else:
+                    image_url = f"{self.CDN_URL}/{product_id}.jpg"
+            else:
+                image_url = f"{self.CDN_URL}/{product_id}.jpg"
+
+            # URL
+            url_path = doc.get("url", "")
+            if url_path and url_path.startswith("/"):
+                product_url = f"{self.SITE_URL}{url_path}"
+            elif url_path:
+                product_url = url_path
+            else:
+                product_url = f"{self.SITE_URL}/p/{product_id}"
+
+            # Region from variety field: "Tintos d.o. catalanas", "Blancos otras d.o."
+            region = None
+            variety = doc.get("variety", "")
+            if variety:
+                region = self._extract_region_from_variety(variety)
+            if not region:
+                region = self._extract_region(name)
+
+            # Wine type
+            wine_type = self._extract_wine_type(name)
+            if not wine_type:
+                # Try from family/category
+                family = doc.get("family", "")
+                if "tinto" in family.lower():
+                    wine_type = WineType.TINTO.value
+                elif "blanco" in family.lower():
+                    wine_type = WineType.BLANCO.value
+                elif "rosado" in family.lower():
+                    wine_type = WineType.ROSADO.value
+                elif "cava" in family.lower() or "champan" in family.lower():
+                    wine_type = WineType.CAVA.value
+                else:
+                    wine_type = search_type.value
+
+            return Wine(
+                id=f"condis_{product_id}",
+                name=name,
+                brand=brand,
+                price=price,
+                price_per_liter=price_per_liter,
+                store=Store.CONDIS.value,
+                url=product_url,
+                image_url=image_url,
+                ean=None,
+                region=region,
+                wine_type=wine_type,
+                discount_price=discount_price,
+                discount_percent=discount_percent,
+            )
+        except Exception as e:
+            print(f"Error parsing Condis doc: {e}")
+            return None
+
+    def _extract_region_from_variety(self, variety: str) -> Optional[str]:
+        """Extract D.O. region from Condis variety field"""
+        variety_lower = variety.lower()
+        region_map = {
+            "rioja": "Rioja",
+            "ribera": "Ribera del Duero",
+            "rueda": "Rueda",
+            "rias baixas": "R\u00EDas Baixas",
+            "priorat": "Priorat",
+            "pened\u00E8s": "Pened\u00E8s",
+            "penedes": "Pened\u00E8s",
+            "catalanas": "Cataluña",
+            "jumilla": "Jumilla",
+            "toro": "Toro",
+            "navarra": "Navarra",
+            "somontano": "Somontano",
+            "campo de borja": "Campo de Borja",
+        }
+        for key, region in region_map.items():
+            if key in variety_lower:
+                return region
+        return None
+
+    def _extract_region(self, name: str) -> Optional[str]:
+        """Extract DO region from wine name"""
+        regions = [
+            "Rioja", "Ribera del Duero", "Rueda", "R\u00EDas Baixas",
+            "Priorat", "Pened\u00E8s", "Jumilla", "Toro", "Navarra",
+            "La Mancha", "Valdepe\u00F1as", "Utiel-Requena", "Cari\u00F1ena",
+            "Somontano", "Campo de Borja", "Bierzo", "Yecla",
+        ]
+        name_lower = name.lower()
+        for region in regions:
+            if region.lower() in name_lower:
+                return region
+        return None
+
+    def _extract_wine_type(self, name: str) -> Optional[str]:
+        """Extract wine type from name"""
+        name_lower = name.lower()
+        if "tinto" in name_lower:
+            return WineType.TINTO.value
+        elif "blanco" in name_lower:
+            return WineType.BLANCO.value
+        elif "rosado" in name_lower:
+            return WineType.ROSADO.value
+        elif "cava" in name_lower:
+            return WineType.CAVA.value
+        elif "espumoso" in name_lower:
+            return WineType.ESPUMOSO.value
+        return None
+
+
 class WineAggregator:
     """
     Wine aggregator from all stores.
     Uses ThreadPoolExecutor for parallel fetching.
     """
-    
+
     def __init__(self, postal_code: str = "46001"):
         self.postal_code = postal_code
         self.consum = ConsumParser(postal_code)
         self.mercadona = MercadonaParser()  # TODO: postal_code -> warehouse mapping
         self.masymas = MasymasParser(postal_code)
         self.dia = DIAParser(postal_code)
-        self._parsers = [self.consum, self.mercadona, self.masymas, self.dia]
+        self.condis = CondisParser(postal_code)
+        self._parsers = [self.consum, self.mercadona, self.masymas, self.dia, self.condis]
     
     def search_all(self, wine_type: WineType = WineType.TINTO, limit_per_store: int = 20) -> list[Wine]:
         """Search wines across all stores IN PARALLEL"""

@@ -16,7 +16,7 @@ from wine_parser import WineAggregator, WineType, Wine as ParserWine
 
 app = FastAPI(
     title="Pomogaika Wine API",
-    description="Wine pairing API with real data from Consum & Mercadona",
+    description="Wine pairing API with real data from Spanish supermarkets",
     version="2.0.0"
 )
 
@@ -135,6 +135,8 @@ def fetch_wines_sync(postal_code: str = "46001") -> list[ParserWine]:
         "cerveza", "zumo", "refresco", "agua mineral",
         "aceite", "vinagre", "queso", "chorizo", "salchich",
         "pat\u00E9", "conserva", "lata de", "atun", "at\u00FAn",
+        "cafe", "caf\u00E9", "capsula", "c\u00E1psula", "nespresso",
+        "pimienta", "pimiento", "especias",
     ]
     all_wines = [
         w for w in all_wines
@@ -211,7 +213,7 @@ async def root():
     return {
         "name": "Pomogaika Wine API",
         "version": "2.0.0",
-        "stores": ["Consum", "Mercadona", "Masymas", "DIA"],
+        "stores": ["Consum", "Mercadona", "Masymas", "DIA", "Condis"],
         "endpoints": ["/recommend", "/search", "/expert", "/health"]
     }
 
@@ -722,7 +724,7 @@ async def search_wines(
     region: Optional[str] = Query(None, description="DO Region"),
     min_price: float = Query(0, description="Minimum price"),
     max_price: float = Query(100.0, description="Maximum price"),
-    store: Optional[str] = Query(None, description="consum, mercadona, masymas, dia"),
+    store: Optional[str] = Query(None, description="consum, mercadona, masymas, dia, condis"),
     postal_code: str = Query("46001", description="Postal code"),
     limit: int = Query(80, description="Number of results")
 ):
@@ -792,6 +794,12 @@ async def get_stores():
                 "name": "DIA",
                 "has_ean": False,
                 "coverage": "Toda España"
+            },
+            {
+                "id": "condis",
+                "name": "Condis",
+                "has_ean": False,
+                "coverage": "Cataluña (Barcelona)"
             }
         ]
     }
@@ -867,7 +875,18 @@ async def debug_store(store_name: str):
             wines = parser.search_wines(WineType.TINTO, limit=5)
             result["wines_count"] = len(wines)
             result["status"] = "ok" if wines else "empty"
-            
+
+        elif store_name == "condis":
+            from wine_parser import CondisParser, WineType
+            parser = CondisParser()
+            wines = parser.search_wines(WineType.TINTO, limit=5)
+            result["wines_count"] = len(wines)
+            result["sample_wines"] = [
+                {"name": w.name, "price": w.price, "brand": w.brand, "region": w.region}
+                for w in wines[:3]
+            ]
+            result["status"] = "ok" if wines else "empty"
+
         else:
             result["error"] = f"Unknown store: {store_name}"
             
