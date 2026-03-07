@@ -75,6 +75,17 @@ class ExpertCreate(BaseModel):
     avatar_url: Optional[str] = None
 
 
+class UserCreate(BaseModel):
+    email: str
+    password: str
+    name: str
+    role: str = "editor"  # "admin" or "editor"
+
+
+class UserRoleUpdate(BaseModel):
+    role: str  # "admin" or "editor"
+
+
 # === Auth Endpoints ===
 
 @admin_router.post("/login")
@@ -175,6 +186,101 @@ async def update_expert(
     result = sb.table("experts").update(update_data).eq("id", expert_id).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Expert not found")
+    return result.data[0]
+
+
+# === Users Endpoints (admin only) ===
+
+@admin_router.get("/users")
+async def admin_list_users(user: AdminUser = Depends(require_admin)):
+    """List all admin users"""
+    sb = get_supabase()
+    result = sb.table("admin_users").select("*").order("created_at").execute()
+    return result.data
+
+
+@admin_router.post("/users")
+async def create_user(req: UserCreate, user: AdminUser = Depends(require_admin)):
+    """Create a new admin/editor user via Supabase Auth"""
+    sb = get_supabase()
+
+    if req.role not in ("admin", "editor"):
+        raise HTTPException(status_code=400, detail="Role must be 'admin' or 'editor'")
+
+    # 1. Create user in Supabase Auth
+    try:
+        import httpx
+        import os
+
+        supabase_url = os.environ.get("SUPABASE_URL", "")
+        service_key = os.environ.get("SUPABASE_SERVICE_KEY", "")
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{supabase_url}/auth/v1/admin/users",
+                headers={
+                    "apikey": service_key,
+                    "Authorization": f"Bearer {service_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "email": req.email,
+                    "password": req.password,
+                    "email_confirm": True,
+                },
+            )
+
+        if resp.status_code >= 400:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to create auth user: {resp.text}"
+            )
+
+        auth_user = resp.json()
+        auth_user_id = auth_user["id"]
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Auth creation failed: {str(e)}")
+
+    # 2. Insert into admin_users table
+    try:
+        result = sb.table("admin_users").insert({
+            "auth_user_id": auth_user_id,
+            "email": req.email,
+            "name": req.name,
+            "role": req.role,
+        }).execute()
+
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to create admin user record")
+
+        return result.data[0]
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB insert failed: {str(e)}")
+
+
+@admin_router.put("/users/{user_id}")
+async def update_user_role(
+    user_id: str, req: UserRoleUpdate,
+    user: AdminUser = Depends(require_admin)
+):
+    """Update user role (admin only)"""
+    if req.role not in ("admin", "editor"):
+        raise HTTPException(status_code=400, detail="Role must be 'admin' or 'editor'")
+
+    sb = get_supabase()
+    result = sb.table("admin_users").update(
+        {"role": req.role}
+    ).eq("id", user_id).execute()
+
+    if not result.data:
+        raise HTTPException(status_code=404, detail="User not found")
+
     return result.data[0]
 
 
