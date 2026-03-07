@@ -13,12 +13,17 @@ from concurrent.futures import ThreadPoolExecutor
 
 from sommelier import SommelierEngine
 from wine_parser import WineAggregator, WineType, Wine as ParserWine
+from content_routes import admin_router, public_router
 
 app = FastAPI(
     title="Pomogaika Wine API",
     description="Wine pairing API with real data from Spanish supermarkets",
-    version="2.0.0"
+    version="3.0.0"
 )
+
+# Content API routers (articles, events, experts, admin)
+app.include_router(admin_router)
+app.include_router(public_router)
 
 app.add_middleware(
     CORSMiddleware,
