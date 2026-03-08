@@ -89,6 +89,7 @@ class UserRoleUpdate(BaseModel):
 # === Auth Endpoints ===
 
 @admin_router.post("/login")
+@supabase_query
 async def admin_login(req: LoginRequest):
     """Login with email/password, returns JWT token + user role"""
     sb = get_supabase()
@@ -130,6 +131,7 @@ async def admin_login(req: LoginRequest):
 
 
 @admin_router.post("/refresh")
+@supabase_query
 async def refresh_token(refresh_token: str):
     """Refresh an expired JWT token"""
     sb = get_supabase()
@@ -156,6 +158,7 @@ async def get_me(user: AdminUser = Depends(get_current_user)):
 # === Experts Endpoints ===
 
 @admin_router.get("/experts")
+@supabase_query
 async def admin_list_experts(user: AdminUser = Depends(get_current_user)):
     """List all experts (admin)"""
     sb = get_supabase()
@@ -164,6 +167,7 @@ async def admin_list_experts(user: AdminUser = Depends(get_current_user)):
 
 
 @admin_router.post("/experts")
+@supabase_query
 async def create_expert(expert: ExpertCreate, user: AdminUser = Depends(require_admin)):
     """Create a new expert (admin only)"""
     sb = get_supabase()
@@ -176,6 +180,7 @@ async def create_expert(expert: ExpertCreate, user: AdminUser = Depends(require_
 
 
 @admin_router.put("/experts/{expert_id}")
+@supabase_query
 async def update_expert(
     expert_id: str, expert: ExpertCreate,
     user: AdminUser = Depends(require_admin)
@@ -192,6 +197,7 @@ async def update_expert(
 # === Users Endpoints (admin only) ===
 
 @admin_router.get("/users")
+@supabase_query
 async def admin_list_users(user: AdminUser = Depends(require_admin)):
     """List all admin users"""
     sb = get_supabase()
@@ -200,6 +206,7 @@ async def admin_list_users(user: AdminUser = Depends(require_admin)):
 
 
 @admin_router.post("/users")
+@supabase_query
 async def create_user(req: UserCreate, user: AdminUser = Depends(require_admin)):
     """Create a new admin/editor user via Supabase Auth"""
     sb = get_supabase()
@@ -265,6 +272,7 @@ async def create_user(req: UserCreate, user: AdminUser = Depends(require_admin))
 
 
 @admin_router.put("/users/{user_id}")
+@supabase_query
 async def update_user_role(
     user_id: str, req: UserRoleUpdate,
     user: AdminUser = Depends(require_admin)
@@ -287,6 +295,7 @@ async def update_user_role(
 # === Articles Endpoints ===
 
 @admin_router.get("/articles")
+@supabase_query
 async def admin_list_articles(user: AdminUser = Depends(get_current_user)):
     """List all articles with expert info (admin)"""
     sb = get_supabase()
@@ -297,6 +306,7 @@ async def admin_list_articles(user: AdminUser = Depends(get_current_user)):
 
 
 @admin_router.post("/articles")
+@supabase_query
 async def create_article(
     article: ArticleCreate,
     background_tasks: BackgroundTasks,
@@ -331,6 +341,7 @@ async def create_article(
 
 
 @admin_router.put("/articles/{article_id}")
+@supabase_query
 async def update_article(
     article_id: str,
     article: ArticleUpdate,
@@ -359,6 +370,7 @@ async def update_article(
 
 
 @admin_router.delete("/articles/{article_id}")
+@supabase_query
 async def delete_article(
     article_id: str,
     user: AdminUser = Depends(get_current_user)
@@ -370,6 +382,7 @@ async def delete_article(
 
 
 @admin_router.post("/articles/{article_id}/translate")
+@supabase_query
 async def translate_article_manual(
     article_id: str,
     user: AdminUser = Depends(get_current_user)
@@ -398,6 +411,7 @@ async def translate_article_manual(
 # === Events Endpoints ===
 
 @admin_router.get("/events")
+@supabase_query
 async def admin_list_events(user: AdminUser = Depends(get_current_user)):
     """List all events (admin)"""
     sb = get_supabase()
@@ -406,6 +420,7 @@ async def admin_list_events(user: AdminUser = Depends(get_current_user)):
 
 
 @admin_router.post("/events")
+@supabase_query
 async def create_event(
     event: EventCreate,
     background_tasks: BackgroundTasks,
@@ -439,6 +454,7 @@ async def create_event(
 
 
 @admin_router.put("/events/{event_id}")
+@supabase_query
 async def update_event(
     event_id: str,
     event: EventUpdate,
@@ -466,6 +482,7 @@ async def update_event(
 
 
 @admin_router.delete("/events/{event_id}")
+@supabase_query
 async def delete_event(
     event_id: str,
     user: AdminUser = Depends(get_current_user)
@@ -477,6 +494,7 @@ async def delete_event(
 
 
 @admin_router.post("/events/{event_id}/translate")
+@supabase_query
 async def translate_event_manual(
     event_id: str,
     user: AdminUser = Depends(get_current_user)
@@ -504,6 +522,7 @@ async def translate_event_manual(
 # === Event Clicks (admin stats) ===
 
 @admin_router.get("/event-clicks")
+@supabase_query
 async def list_event_clicks(
     event_id: Optional[str] = None,
     user: AdminUser = Depends(require_admin)
@@ -522,6 +541,7 @@ async def list_event_clicks(
 
 
 @admin_router.get("/event-clicks/stats")
+@supabase_query
 async def event_clicks_stats(user: AdminUser = Depends(require_admin)):
     """Aggregated stats for all events (admin only)"""
     sb = get_supabase()
@@ -609,6 +629,7 @@ async def public_active_events(lang: str = "ru"):
 
 
 @public_router.post("/events/{event_id}/register")
+@supabase_query
 async def public_register_event(event_id: str, reg: EventRegister):
     """Register user interest in an event (click-through to Telegram)"""
     sb = get_supabase()
