@@ -556,20 +556,23 @@ async def public_list_articles(lang: str = "ru", limit: int = 10):
     Get published articles for mobile apps.
     Returns articles with expert info, translated to requested language.
     """
-    sb = get_supabase()
-    result = sb.table("articles").select(
-        "id, title, body, image_url, language, translations, created_at, "
-        "experts(id, name, avatar_url)"
-    ).eq(
-        "is_published", True
-    ).order("created_at", desc=True).limit(limit).execute()
+    try:
+        sb = get_supabase()
+        result = sb.table("articles").select(
+            "id, title, body, image_url, language, translations, created_at, "
+            "experts(id, name, avatar_url)"
+        ).eq(
+            "is_published", True
+        ).order("created_at", desc=True).limit(limit).execute()
 
-    articles = []
-    for row in result.data:
-        article = _localize_article(row, lang)
-        articles.append(article)
+        articles = []
+        for row in result.data:
+            article = _localize_article(row, lang)
+            articles.append(article)
 
-    return articles
+        return articles
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Articles error: {type(e).__name__}: {str(e)}")
 
 
 @public_router.get("/articles/{article_id}")
@@ -590,19 +593,22 @@ async def public_get_article(article_id: str, lang: str = "ru"):
 @public_router.get("/events/active")
 async def public_active_events(lang: str = "ru"):
     """Get active upcoming events for mobile apps"""
-    sb = get_supabase()
-    result = sb.table("events").select("*").eq(
-        "is_active", True
-    ).gte(
-        "event_date", datetime.utcnow().isoformat()
-    ).order("event_date").execute()
+    try:
+        sb = get_supabase()
+        result = sb.table("events").select("*").eq(
+            "is_active", True
+        ).gte(
+            "event_date", datetime.utcnow().isoformat()
+        ).order("event_date").execute()
 
-    events = []
-    for row in result.data:
-        event = _localize_event(row, lang)
-        events.append(event)
+        events = []
+        for row in result.data:
+            event = _localize_event(row, lang)
+            events.append(event)
 
-    return events
+        return events
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Events error: {type(e).__name__}: {str(e)}")
 
 
 @public_router.post("/events/{event_id}/register")
@@ -636,9 +642,12 @@ async def public_register_event(event_id: str, reg: EventRegister):
 @public_router.get("/experts")
 async def public_list_experts():
     """Get list of wine experts"""
-    sb = get_supabase()
-    result = sb.table("experts").select("id, name, bio, avatar_url").execute()
-    return result.data
+    try:
+        sb = get_supabase()
+        result = sb.table("experts").select("id, name, bio, avatar_url").execute()
+        return result.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Experts error: {type(e).__name__}: {str(e)}")
 
 
 # === Helper Functions ===
