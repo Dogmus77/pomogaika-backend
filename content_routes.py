@@ -84,6 +84,11 @@ class EventRegister(BaseModel):
     platform: Optional[str] = None  # "ios" or "android"
 
 
+class ContentView(BaseModel):
+    device_id: Optional[str] = None
+    platform: Optional[str] = None  # "ios", "android", "web"
+
+
 class ExpertCreate(BaseModel):
     name: str
     bio: Optional[str] = None
@@ -812,6 +817,88 @@ async def event_clicks_stats(user: AdminUser = Depends(require_admin)):
     return stats
 
 
+# === View Stats (admin) ===
+
+@admin_router.get("/article-views/stats")
+@supabase_query
+async def article_views_stats(user: AdminUser = Depends(require_admin)):
+    """Aggregated article view stats (admin only)"""
+    sb = get_supabase()
+
+    articles = sb.table("articles").select(
+        "id, title, is_published, created_at"
+    ).order("created_at", desc=True).execute()
+
+    stats = []
+    for article in articles.data:
+        # Total views
+        views = sb.table("article_views").select(
+            "id", count="exact"
+        ).eq("article_id", article["id"]).execute()
+
+        # Unique viewers (distinct device_id)
+        unique_views = sb.table("article_views").select(
+            "device_id"
+        ).eq("article_id", article["id"]).execute()
+        unique_count = len(set(
+            v["device_id"] for v in unique_views.data if v.get("device_id")
+        ))
+
+        stats.append({
+            "article_id": article["id"],
+            "title": article["title"],
+            "is_published": article["is_published"],
+            "created_at": article["created_at"],
+            "view_count": views.count or 0,
+            "unique_viewers": unique_count,
+        })
+
+    return stats
+
+
+@admin_router.get("/event-views/stats")
+@supabase_query
+async def event_views_stats(user: AdminUser = Depends(require_admin)):
+    """Aggregated event view + registration stats (admin only)"""
+    sb = get_supabase()
+
+    events = sb.table("events").select(
+        "id, title, event_date, is_active"
+    ).order("event_date", desc=True).execute()
+
+    stats = []
+    for event in events.data:
+        # Total views
+        views = sb.table("event_views").select(
+            "id", count="exact"
+        ).eq("event_id", event["id"]).execute()
+
+        # Unique viewers
+        unique_views = sb.table("event_views").select(
+            "device_id"
+        ).eq("event_id", event["id"]).execute()
+        unique_count = len(set(
+            v["device_id"] for v in unique_views.data if v.get("device_id")
+        ))
+
+        # Registration count from event_clicks
+        clicks = sb.table("event_clicks").select(
+            "id", count="exact"
+        ).eq("event_id", event["id"]).execute()
+
+        stats.append({
+            "event_id": event["id"],
+            "title": event["title"],
+            "event_date": event["event_date"],
+            "is_active": event["is_active"],
+            "view_count": views.count or 0,
+            "unique_viewers": unique_count,
+            "registration_count": clicks.count or 0,
+        })
+
+    return stats
+
+
 # === Public Endpoints (for mobile apps & website) ===
 
 @public_router.get("/articles")
@@ -861,6 +948,57 @@ async def public_get_article(article_id: str, lang: str = "ru"):
         raise HTTPException(status_code=404, detail="Article not available in this language")
 
     return _localize_article(row, lang)
+
+
+@public_router.post("/articles/{article_id}/view")
+@supabase_query
+async def track_article_view(article_id: str, view: ContentView):
+    """Track article view from mobile app. Deduplicates by device_id per 24h."""
+    sb = get_supabase()
+
+    # Dedup: same device, same article, last 24h
+    if view.device_id:
+        from datetime import timedelta
+        cutoff = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+        existing = sb.table("article_views").select("id", count="exact").eq(
+            "article_id", article_id
+        ).eq("device_id", view.device_id).gte("viewed_at", cutoff).execute()
+
+        if existing.count and existing.count > 0:
+            return {"status": "duplicate"}
+
+    sb.table("article_views").insert({
+        "article_id": article_id,
+        "device_id": view.device_id,
+        "platform": view.platform,
+    }).execute()
+
+    return {"status": "ok"}
+
+
+@public_router.post("/events/{event_id}/view")
+@supabase_query
+async def track_event_view(event_id: str, view: ContentView):
+    """Track event view from mobile app. Deduplicates by device_id per 24h."""
+    sb = get_supabase()
+
+    if view.device_id:
+        from datetime import timedelta
+        cutoff = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+        existing = sb.table("event_views").select("id", count="exact").eq(
+            "event_id", event_id
+        ).eq("device_id", view.device_id).gte("viewed_at", cutoff).execute()
+
+        if existing.count and existing.count > 0:
+            return {"status": "duplicate"}
+
+    sb.table("event_views").insert({
+        "event_id": event_id,
+        "device_id": view.device_id,
+        "platform": view.platform,
+    }).execute()
+
+    return {"status": "ok"}
 
 
 @public_router.get("/events/active")
