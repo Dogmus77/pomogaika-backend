@@ -557,35 +557,61 @@ async def translate_article_sync_test(
     article_id: str,
     user: AdminUser = Depends(get_current_user)
 ):
-    """DEBUG: Run translation synchronously (await directly, not in background).
-    This helps isolate whether the issue is background task execution or translation itself.
-    """
+    """DEBUG: Run translation synchronously and return detailed diagnostics."""
+    import httpx
+
     sb = get_supabase()
     result = sb.table("articles").select("*").eq("id", article_id).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Article not found")
 
     article = result.data[0]
-    logger.info(f"SYNC translate: article {article_id}, lang={article['language']}, body_len={len(article['body'])}")
+    diagnostics = {
+        "article_id": article_id,
+        "language": article["language"],
+        "title_len": len(article["title"]),
+        "body_len": len(article["body"]),
+    }
 
+    # Step 1: Test raw MyMemory API call with a simple short text
+    test_text = "Привет мир"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                "https://api.mymemory.translated.net/get",
+                data={
+                    "q": test_text,
+                    "langpair": "ru-RU|en-GB",
+                    "de": "pomogaika.app@gmail.com",
+                }
+            )
+            raw = resp.json()
+            diagnostics["mymemory_test"] = {
+                "status_code": resp.status_code,
+                "response_status": raw.get("responseStatus"),
+                "translated": raw.get("responseData", {}).get("translatedText", ""),
+                "quota_finished": raw.get("quotaFinished", False),
+                "raw_keys": list(raw.keys()),
+            }
+    except Exception as e:
+        diagnostics["mymemory_test"] = {"error": str(e)}
+
+    # Step 2: Try full translation
     try:
         translations = await translate_article(article["title"], article["body"], article["language"])
-        logger.info(f"SYNC translate result: {list(translations.keys()) if translations else 'EMPTY'}")
-
+        diagnostics["full_translate"] = {
+            "languages": list(translations.keys()) if translations else [],
+            "count": len(translations) if translations else 0,
+        }
         if translations:
             sb.table("articles").update(
                 {"translations": translations}
             ).eq("id", article_id).execute()
-            return {
-                "status": "ok",
-                "languages": list(translations.keys()),
-                "count": len(translations),
-            }
-        else:
-            return {"status": "empty", "languages": [], "count": 0}
+            diagnostics["saved"] = True
     except Exception as e:
-        logger.error(f"SYNC translate error: {e}", exc_info=True)
-        return {"status": "error", "error": str(e)}
+        diagnostics["full_translate"] = {"error": str(e)}
+
+    return diagnostics
 
 
 @admin_router.post("/articles/{article_id}/refresh")
