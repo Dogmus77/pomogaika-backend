@@ -693,7 +693,18 @@ BODY:
         result = sb.table("articles").insert(insert_data).execute()
 
         if result.data:
-            logger.info(f"Generated article: '{title}' (id: {result.data[0]['id']})")
+            article_id = result.data[0]['id']
+            logger.info(f"Generated article: '{title}' (id: {article_id})")
+            # Auto-translate the generated article
+            try:
+                translations = await translate_article(title, body, "ru")
+                if translations:
+                    sb.table("articles").update(
+                        {"translations": translations}
+                    ).eq("id", article_id).execute()
+                    logger.info(f"Auto-translated generated article {article_id}: {list(translations.keys())}")
+            except Exception as te:
+                logger.error(f"Auto-translate failed for generated article {article_id}: {te}")
         else:
             logger.error("Generate article: failed to insert into DB")
 
@@ -1485,32 +1496,46 @@ def _localize_event(row: dict, lang: str) -> dict:
 
 # === Background Tasks ===
 
-async def _translate_article_task(article_id: str, title: str, body: str, language: str):
-    """Background task: translate article and save to DB"""
+def _translate_article_task(article_id: str, title: str, body: str, language: str):
+    """Background task: translate article and save to DB.
+    Uses sync wrapper with own event loop (async BackgroundTasks unreliable on some ASGI servers).
+    """
+    import asyncio
     try:
-        translations = await translate_article(title, body, language)
+        loop = asyncio.new_event_loop()
+        translations = loop.run_until_complete(translate_article(title, body, language))
+        loop.close()
         if translations:
             sb = get_supabase()
             sb.table("articles").update(
                 {"translations": translations}
             ).eq("id", article_id).execute()
+            logger.info(f"Background translation completed for article {article_id}: {list(translations.keys())}")
+        else:
+            logger.warning(f"Background translation returned empty for article {article_id}")
     except Exception as e:
-        import logging
-        logging.error(f"Background translation failed for article {article_id}: {e}")
+        logger.error(f"Background translation failed for article {article_id}: {e}")
 
 
-async def _translate_event_task(event_id: str, title: str, description: str | None, language: str):
-    """Background task: translate event and save to DB"""
+def _translate_event_task(event_id: str, title: str, description: str | None, language: str):
+    """Background task: translate event and save to DB.
+    Uses sync wrapper with own event loop (async BackgroundTasks unreliable on some ASGI servers).
+    """
+    import asyncio
     try:
-        translations = await translate_event(title, description, language)
+        loop = asyncio.new_event_loop()
+        translations = loop.run_until_complete(translate_event(title, description, language))
+        loop.close()
         if translations:
             sb = get_supabase()
             sb.table("events").update(
                 {"translations": translations}
             ).eq("id", event_id).execute()
+            logger.info(f"Background translation completed for event {event_id}: {list(translations.keys())}")
+        else:
+            logger.warning(f"Background translation returned empty for event {event_id}")
     except Exception as e:
-        import logging
-        logging.error(f"Background translation failed for event {event_id}: {e}")
+        logger.error(f"Background translation failed for event {event_id}: {e}")
 
 
 async def _send_registration_email(event_title: str, registration_data: dict, to_email: str):
