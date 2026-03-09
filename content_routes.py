@@ -3,14 +3,19 @@ Content API routes: articles, events, experts
 Handles both admin (CRUD) and public (read) endpoints
 """
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Query as QueryParam
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
+import uuid as uuid_mod
+import io
+import logging
 
 from supabase_client import get_supabase, supabase_query
 from auth import AdminUser, get_current_user, require_admin
 from translation import translate_article, translate_event
+
+logger = logging.getLogger(__name__)
 
 # === Routers ===
 
@@ -296,6 +301,75 @@ async def update_user_role(
         raise HTTPException(status_code=404, detail="User not found")
 
     return result.data[0]
+
+
+# === Image Upload ===
+
+@admin_router.post("/upload/image")
+@supabase_query
+async def upload_image(
+    file: UploadFile = File(...),
+    type: str = QueryParam("article", description="article, avatar, or event"),
+    user: AdminUser = Depends(get_current_user)
+):
+    """Upload and resize an image, store in Supabase Storage"""
+    import os
+    from PIL import Image
+
+    # Validate file type
+    allowed_types = {"image/jpeg", "image/png", "image/webp"}
+    if file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail=f"File type {file.content_type} not allowed. Use JPEG, PNG or WebP.")
+
+    # Read file (max 10MB)
+    contents = await file.read()
+    if len(contents) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large (max 10MB)")
+
+    # Process with Pillow
+    try:
+        img = Image.open(io.BytesIO(contents))
+        img = img.convert("RGB")  # Ensure RGB for JPEG output
+
+        if type == "avatar":
+            # Square center crop + resize to 256x256
+            size = min(img.width, img.height)
+            left = (img.width - size) // 2
+            top = (img.height - size) // 2
+            img = img.crop((left, top, left + size, top + size))
+            img = img.resize((256, 256), Image.LANCZOS)
+        else:
+            # Article/event: max width 800px, keep aspect ratio
+            if img.width > 800:
+                ratio = 800 / img.width
+                new_height = int(img.height * ratio)
+                img = img.resize((800, new_height), Image.LANCZOS)
+
+        # Save to bytes
+        buffer = io.BytesIO()
+        img.save(buffer, format="JPEG", quality=85)
+        image_bytes = buffer.getvalue()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Image processing failed: {str(e)}")
+
+    # Upload to Supabase Storage
+    file_path = f"{type}/{uuid_mod.uuid4().hex}.jpg"
+    sb = get_supabase()
+
+    try:
+        sb.storage.from_("content-images").upload(
+            path=file_path,
+            file=image_bytes,
+            file_options={"content-type": "image/jpeg"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Storage upload failed: {str(e)}")
+
+    # Build public URL
+    supabase_url = os.environ.get("SUPABASE_URL", "")
+    public_url = f"{supabase_url}/storage/v1/object/public/content-images/{file_path}"
+
+    return {"url": public_url}
 
 
 # === Articles Endpoints ===
