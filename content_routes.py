@@ -47,6 +47,7 @@ class EventCreate(BaseModel):
     description: Optional[str] = None
     event_date: str  # ISO format
     telegram_url: Optional[str] = None
+    landing_url: Optional[str] = None
     image_url: Optional[str] = None
     language: str = "ru"
     is_active: bool = True
@@ -57,6 +58,7 @@ class EventUpdate(BaseModel):
     description: Optional[str] = None
     event_date: Optional[str] = None
     telegram_url: Optional[str] = None
+    landing_url: Optional[str] = None
     image_url: Optional[str] = None
     language: Optional[str] = None
     is_active: Optional[bool] = None
@@ -73,6 +75,7 @@ class ExpertCreate(BaseModel):
     name: str
     bio: Optional[str] = None
     avatar_url: Optional[str] = None
+    user_id: Optional[str] = None
 
 
 class UserCreate(BaseModel):
@@ -171,11 +174,14 @@ async def admin_list_experts(user: AdminUser = Depends(get_current_user)):
 async def create_expert(expert: ExpertCreate, user: AdminUser = Depends(require_admin)):
     """Create a new expert (admin only)"""
     sb = get_supabase()
-    result = sb.table("experts").insert({
+    insert_data = {
         "name": expert.name,
         "bio": expert.bio,
         "avatar_url": expert.avatar_url,
-    }).execute()
+    }
+    if expert.user_id:
+        insert_data["user_id"] = expert.user_id
+    result = sb.table("experts").insert(insert_data).execute()
     return result.data[0]
 
 
@@ -429,11 +435,14 @@ async def create_event(
     """Create event. Auto-translates in background."""
     sb = get_supabase()
 
+    # Dual-write: landing_url is the primary field, telegram_url kept for backward compat
+    landing = event.landing_url or event.telegram_url
     insert_data = {
         "title": event.title,
         "description": event.description,
         "event_date": event.event_date,
-        "telegram_url": event.telegram_url,
+        "telegram_url": landing,
+        "landing_url": landing,
         "image_url": event.image_url,
         "language": event.language,
         "is_active": event.is_active,
@@ -464,6 +473,12 @@ async def update_event(
     """Update event. Re-translates if content changed."""
     sb = get_supabase()
     update_data = {k: v for k, v in event.model_dump().items() if v is not None}
+
+    # Dual-write: keep telegram_url in sync with landing_url for backward compat
+    if "landing_url" in update_data:
+        update_data["telegram_url"] = update_data["landing_url"]
+    elif "telegram_url" in update_data:
+        update_data["landing_url"] = update_data["telegram_url"]
 
     result = sb.table("events").update(update_data).eq("id", event_id).execute()
     if not result.data:
@@ -635,7 +650,7 @@ async def public_register_event(event_id: str, reg: EventRegister):
     sb = get_supabase()
 
     # Check event exists and is active
-    event = sb.table("events").select("id, telegram_url, is_active").eq(
+    event = sb.table("events").select("id, telegram_url, landing_url, is_active").eq(
         "id", event_id
     ).execute()
 
@@ -654,6 +669,7 @@ async def public_register_event(event_id: str, reg: EventRegister):
     return {
         "status": "registered",
         "telegram_url": event.data[0].get("telegram_url"),
+        "landing_url": event.data[0].get("landing_url"),
     }
 
 
@@ -710,6 +726,7 @@ def _localize_event(row: dict, lang: str) -> dict:
         "description": description,
         "event_date": row["event_date"],
         "telegram_url": row.get("telegram_url"),
+        "landing_url": row.get("landing_url"),
         "image_url": row.get("image_url"),
         "is_active": row.get("is_active"),
     }
