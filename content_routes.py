@@ -45,6 +45,7 @@ class ArticleUpdate(BaseModel):
     image_url: Optional[str] = None
     language: Optional[str] = None
     is_published: Optional[bool] = None
+    disabled_languages: Optional[list] = None
 
 
 class EventCreate(BaseModel):
@@ -488,6 +489,22 @@ async def translate_article_manual(
     }
 
 
+@admin_router.post("/articles/{article_id}/refresh")
+@supabase_query
+async def refresh_article(
+    article_id: str,
+    user: AdminUser = Depends(get_current_user)
+):
+    """Mark article as 'new' by updating refreshed_at timestamp"""
+    sb = get_supabase()
+    result = sb.table("articles").update(
+        {"refreshed_at": datetime.utcnow().isoformat()}
+    ).eq("id", article_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Article not found")
+    return {"status": "refreshed", "article_id": article_id}
+
+
 # === Events Endpoints ===
 
 @admin_router.get("/events")
@@ -665,10 +682,11 @@ async def public_list_articles(lang: str = "ru", limit: int = 10):
     """
     Get published articles for mobile apps.
     Returns articles with expert info, translated to requested language.
+    Filters out articles disabled for the requested language.
     """
     sb = get_supabase()
     result = sb.table("articles").select(
-        "id, title, body, image_url, language, translations, created_at, "
+        "id, title, body, image_url, language, translations, created_at, refreshed_at, disabled_languages, "
         "experts(id, name, avatar_url)"
     ).eq(
         "is_published", True
@@ -676,6 +694,10 @@ async def public_list_articles(lang: str = "ru", limit: int = 10):
 
     articles = []
     for row in result.data:
+        # Skip if article is disabled for this language
+        disabled = row.get("disabled_languages") or []
+        if lang in disabled:
+            continue
         article = _localize_article(row, lang)
         articles.append(article)
 
@@ -688,14 +710,19 @@ async def public_get_article(article_id: str, lang: str = "ru"):
     """Get single article by ID"""
     sb = get_supabase()
     result = sb.table("articles").select(
-        "id, title, body, image_url, language, translations, created_at, "
+        "id, title, body, image_url, language, translations, created_at, refreshed_at, disabled_languages, "
         "experts(id, name, avatar_url)"
     ).eq("id", article_id).eq("is_published", True).execute()
 
     if not result.data:
         raise HTTPException(status_code=404, detail="Article not found")
 
-    return _localize_article(result.data[0], lang)
+    row = result.data[0]
+    disabled = row.get("disabled_languages") or []
+    if lang in disabled:
+        raise HTTPException(status_code=404, detail="Article not available in this language")
+
+    return _localize_article(row, lang)
 
 
 @public_router.get("/events/active")
@@ -777,6 +804,7 @@ def _localize_article(row: dict, lang: str) -> dict:
         "body": body,
         "image_url": row.get("image_url"),
         "created_at": row["created_at"],
+        "refreshed_at": row.get("refreshed_at"),
         "expert": row.get("experts"),
     }
 
