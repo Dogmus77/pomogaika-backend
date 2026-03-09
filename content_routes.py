@@ -557,6 +557,135 @@ async def refresh_article(
     return {"status": "refreshed", "article_id": article_id}
 
 
+@admin_router.post("/articles/generate")
+async def generate_article(
+    background_tasks: BackgroundTasks,
+    user: AdminUser = Depends(require_admin)
+):
+    """Generate a new wine article using Claude AI. Returns immediately, generates in background."""
+    import os
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
+
+    background_tasks.add_task(_generate_article_task, api_key)
+    return {"status": "generation_started", "message": "Article is being generated in background"}
+
+
+async def _generate_article_task(api_key: str):
+    """Background task: generate article with Claude, save to DB, auto-translate."""
+    import anthropic
+
+    try:
+        sb = get_supabase()
+
+        # Get existing article titles to avoid duplicates
+        existing = sb.table("articles").select("title").execute()
+        existing_titles = [a["title"] for a in (existing.data or [])]
+        titles_list = "\n".join(f"- {t}" for t in existing_titles) if existing_titles else "Нет статей"
+
+        # Get Николай expert ID
+        experts = sb.table("experts").select("id, name").execute()
+        nikolay = next((e for e in (experts.data or []) if "Николай" in e.get("name", "") or "николай" in e.get("name", "").lower()), None)
+        if not nikolay:
+            logger.error("Generate article: expert 'Николай' not found")
+            return
+        expert_id = nikolay["id"]
+
+        # Generate with Claude
+        client = anthropic.Anthropic(api_key=api_key)
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2000,
+            messages=[{
+                "role": "user",
+                "content": f"""Ты — Николай, AI-сомелье и винный эксперт с 15-летним стажем. Ты пишешь статьи для приложения Pomogaika — помощник по выбору вина в испанских супермаркетах (Consum, Mercadona, Masymas, DIA, Condis).
+
+Напиши новую статью о вине на русском языке. Статья должна быть:
+- Полезной и практичной для людей, покупающих вино в супермаркетах Испании
+- Длиной 500-800 слов
+- С использованием **жирного** и *курсивного* текста для выделения ключевых моментов (markdown)
+- Написана простым и дружелюбным языком, без снобизма
+- Про конкретную тему (сорта винограда, регионы Испании, сочетания с едой, сезонные рекомендации, как выбрать вино по случаю, и т.д.)
+
+Уже существующие статьи (НЕ повторяй их темы):
+{titles_list}
+
+Ответь СТРОГО в формате:
+TITLE: Заголовок статьи
+IMAGE: ключевое слово для поиска фото на unsplash (на английском, 1-2 слова про вино)
+BODY:
+Текст статьи..."""
+            }]
+        )
+
+        response_text = message.content[0].text.strip()
+
+        # Parse response
+        title = ""
+        image_keyword = "wine"
+        body = ""
+
+        lines = response_text.split("\n")
+        mode = None
+        body_lines = []
+
+        for line in lines:
+            if line.startswith("TITLE:"):
+                title = line[6:].strip()
+                mode = "title"
+            elif line.startswith("IMAGE:"):
+                image_keyword = line[6:].strip()
+                mode = "image"
+            elif line.startswith("BODY:"):
+                mode = "body"
+            elif mode == "body":
+                body_lines.append(line)
+
+        body = "\n".join(body_lines).strip()
+
+        if not title or not body:
+            logger.error(f"Generate article: failed to parse response. Title='{title}', body length={len(body)}")
+            return
+
+        # Unsplash image
+        image_url = f"https://images.unsplash.com/photo-1510812431401-41d2bd2722f3?w=800&q=80"
+        # Try to get a relevant image
+        try:
+            import httpx
+            resp = httpx.get(
+                f"https://api.unsplash.com/search/photos",
+                params={"query": image_keyword, "per_page": 1, "orientation": "landscape"},
+                headers={"Authorization": "Client-ID YOUR_UNSPLASH_KEY"},
+                timeout=5
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("results"):
+                    image_url = data["results"][0]["urls"]["regular"]
+        except Exception:
+            pass  # Use default wine image
+
+        # Save article (as draft)
+        insert_data = {
+            "expert_id": expert_id,
+            "title": title,
+            "body": body,
+            "image_url": image_url,
+            "language": "ru",
+            "is_published": False,
+        }
+        result = sb.table("articles").insert(insert_data).execute()
+
+        if result.data:
+            logger.info(f"Generated article: '{title}' (id: {result.data[0]['id']})")
+        else:
+            logger.error("Generate article: failed to insert into DB")
+
+    except Exception as e:
+        logger.error(f"Generate article error: {e}")
+
+
 class TranslationUpdate(BaseModel):
     title: str
     body: Optional[str] = None
