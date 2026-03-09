@@ -515,28 +515,26 @@ async def delete_article(
 
 
 @admin_router.post("/articles/{article_id}/translate")
-@supabase_query
 async def translate_article_manual(
     article_id: str,
+    background_tasks: BackgroundTasks,
     user: AdminUser = Depends(get_current_user)
 ):
-    """Manually trigger translation for an article"""
+    """Manually trigger translation for an article (runs in background)"""
     sb = get_supabase()
     result = sb.table("articles").select("*").eq("id", article_id).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Article not found")
 
     article = result.data[0]
-    translations = await translate_article(
+    background_tasks.add_task(
+        _translate_article_task, article["id"],
         article["title"], article["body"], article["language"]
     )
 
-    # Save translations
-    sb.table("articles").update({"translations": translations}).eq("id", article_id).execute()
-
     return {
-        "status": "translated",
-        "languages": list(translations.keys()),
+        "status": "translation_started",
+        "message": "Перевод запущен в фоне. Обновите страницу через 30-60 секунд.",
         "article_id": article_id,
     }
 
@@ -810,27 +808,26 @@ async def delete_event(
 
 
 @admin_router.post("/events/{event_id}/translate")
-@supabase_query
 async def translate_event_manual(
     event_id: str,
+    background_tasks: BackgroundTasks,
     user: AdminUser = Depends(get_current_user)
 ):
-    """Manually trigger translation for an event"""
+    """Manually trigger translation for an event (runs in background)"""
     sb = get_supabase()
     result = sb.table("events").select("*").eq("id", event_id).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Event not found")
 
     event = result.data[0]
-    translations = await translate_event(
+    background_tasks.add_task(
+        _translate_event_task, event["id"],
         event["title"], event.get("description"), event["language"]
     )
 
-    sb.table("events").update({"translations": translations}).eq("id", event_id).execute()
-
     return {
-        "status": "translated",
-        "languages": list(translations.keys()),
+        "status": "translation_started",
+        "message": "Перевод запущен в фоне. Обновите страницу через 30-60 секунд.",
         "event_id": event_id,
     }
 
