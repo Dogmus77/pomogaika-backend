@@ -57,6 +57,8 @@ class EventCreate(BaseModel):
     image_url: Optional[str] = None
     language: str = "ru"
     is_active: bool = True
+    registration_fields: Optional[list] = None
+    notification_email: Optional[str] = None
 
 
 class EventUpdate(BaseModel):
@@ -69,11 +71,15 @@ class EventUpdate(BaseModel):
     language: Optional[str] = None
     is_active: Optional[bool] = None
     disabled_languages: Optional[list] = None
+    registration_fields: Optional[list] = None
+    notification_email: Optional[str] = None
 
 
 class EventRegister(BaseModel):
-    user_name: str
-    user_surname: str
+    user_name: Optional[str] = None
+    user_surname: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
     device_id: Optional[str] = None
     platform: Optional[str] = None  # "ios" or "android"
 
@@ -565,6 +571,8 @@ async def create_event(
         "image_url": event.image_url,
         "language": event.language,
         "is_active": event.is_active,
+        "registration_fields": event.registration_fields or [],
+        "notification_email": event.notification_email,
     }
     result = sb.table("events").insert(insert_data).execute()
     if not result.data:
@@ -850,31 +858,62 @@ async def public_active_events(lang: str = "ru"):
 
 @public_router.post("/events/{event_id}/register")
 @supabase_query
-async def public_register_event(event_id: str, reg: EventRegister):
-    """Register user interest in an event (click-through to Telegram)"""
+async def public_register_event(
+    event_id: str,
+    reg: EventRegister,
+    background_tasks: BackgroundTasks
+):
+    """Register user for an event with dynamic fields"""
     sb = get_supabase()
 
     # Check event exists and is active
-    event = sb.table("events").select("id, telegram_url, landing_url, is_active").eq(
-        "id", event_id
-    ).execute()
+    event = sb.table("events").select(
+        "id, title, telegram_url, landing_url, is_active, registration_fields, notification_email"
+    ).eq("id", event_id).execute()
 
     if not event.data or not event.data[0].get("is_active"):
         raise HTTPException(status_code=404, detail="Event not found or inactive")
 
-    # Record click
-    sb.table("event_clicks").insert({
+    event_data = event.data[0]
+
+    # Validate required fields from registration_fields config
+    reg_fields = event_data.get("registration_fields") or []
+    for field_config in reg_fields:
+        field_name = field_config.get("field")
+        if field_config.get("required"):
+            value = getattr(reg, field_name, None) if field_name else None
+            if not value:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Field '{field_name}' is required"
+                )
+
+    # Record registration
+    click_data = {
         "event_id": event_id,
         "user_name": reg.user_name,
         "user_surname": reg.user_surname,
+        "email": reg.email,
+        "phone": reg.phone,
         "device_id": reg.device_id,
         "platform": reg.platform,
-    }).execute()
+    }
+    sb.table("event_clicks").insert(click_data).execute()
+
+    # Send notification email in background
+    notification_email = event_data.get("notification_email")
+    if notification_email:
+        background_tasks.add_task(
+            _send_registration_email,
+            event_data["title"],
+            click_data,
+            notification_email
+        )
 
     return {
         "status": "registered",
-        "telegram_url": event.data[0].get("telegram_url"),
-        "landing_url": event.data[0].get("landing_url"),
+        "telegram_url": event_data.get("telegram_url"),
+        "landing_url": event_data.get("landing_url"),
     }
 
 
@@ -968,3 +1007,50 @@ async def _translate_event_task(event_id: str, title: str, description: str | No
     except Exception as e:
         import logging
         logging.error(f"Background translation failed for event {event_id}: {e}")
+
+
+async def _send_registration_email(event_title: str, registration_data: dict, to_email: str):
+    """Background task: send email notification about new event registration"""
+    import os
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+
+    smtp_host = os.environ.get("SMTP_HOST", "mail.pomogaika.info")
+    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+    smtp_user = os.environ.get("SMTP_USER", "info@pomogaika.info")
+    smtp_password = os.environ.get("SMTP_PASSWORD", "")
+
+    if not smtp_password:
+        logger.warning("SMTP_PASSWORD not set, skipping registration email")
+        return
+
+    try:
+        # Build email body
+        name = f"{registration_data.get('user_name', '')} {registration_data.get('user_surname', '')}".strip() or "Не указано"
+        email = registration_data.get('email') or "Не указан"
+        phone = registration_data.get('phone') or "Не указан"
+        platform = registration_data.get('platform') or "Не указана"
+
+        body = f"""Новая регистрация на событие "{event_title}"
+
+Имя: {name}
+Email: {email}
+Телефон: {phone}
+Платформа: {platform}
+"""
+
+        msg = MIMEMultipart()
+        msg["From"] = smtp_user
+        msg["To"] = to_email
+        msg["Subject"] = f"Новая регистрация: {event_title}"
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_password)
+            server.send_message(msg)
+
+        logger.info(f"Registration email sent for event '{event_title}' to {to_email}")
+    except Exception as e:
+        logger.error(f"Failed to send registration email: {e}")
