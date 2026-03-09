@@ -89,6 +89,16 @@ class ContentView(BaseModel):
     platform: Optional[str] = None  # "ios", "android", "web"
 
 
+class QuickRegister(BaseModel):
+    device_id: str
+    platform: Optional[str] = None  # "ios", "android"
+
+
+class ContentReaction(BaseModel):
+    device_id: str
+    reaction: str  # "like" or "dislike"
+
+
 class ExpertCreate(BaseModel):
     name: str
     bio: Optional[str] = None
@@ -850,6 +860,13 @@ async def article_views_stats(user: AdminUser = Depends(require_admin)):
             v["device_id"] for v in unique_views.data if v.get("device_id")
         ))
 
+        # Reactions
+        reactions = sb.table("content_reactions").select("reaction").eq(
+            "content_type", "article"
+        ).eq("content_id", article["id"]).execute()
+        likes = sum(1 for r in reactions.data if r["reaction"] == "like")
+        dislikes = sum(1 for r in reactions.data if r["reaction"] == "dislike")
+
         stats.append({
             "article_id": article["id"],
             "title": article["title"],
@@ -857,6 +874,8 @@ async def article_views_stats(user: AdminUser = Depends(require_admin)):
             "created_at": article["created_at"],
             "view_count": views.count or 0,
             "unique_viewers": unique_count,
+            "likes": likes,
+            "dislikes": dislikes,
         })
 
     return {"stats": stats, "total_unique_readers": total_unique}
@@ -898,6 +917,13 @@ async def event_views_stats(user: AdminUser = Depends(require_admin)):
             "id", count="exact"
         ).eq("event_id", event["id"]).execute()
 
+        # Reactions
+        reactions = sb.table("content_reactions").select("reaction").eq(
+            "content_type", "event"
+        ).eq("content_id", event["id"]).execute()
+        likes = sum(1 for r in reactions.data if r["reaction"] == "like")
+        dislikes = sum(1 for r in reactions.data if r["reaction"] == "dislike")
+
         stats.append({
             "event_id": event["id"],
             "title": event["title"],
@@ -906,6 +932,8 @@ async def event_views_stats(user: AdminUser = Depends(require_admin)):
             "view_count": views.count or 0,
             "unique_viewers": unique_count,
             "registration_count": clicks.count or 0,
+            "likes": likes,
+            "dislikes": dislikes,
         })
 
     return {"stats": stats, "total_unique_viewers": total_unique}
@@ -1031,6 +1059,11 @@ async def public_active_events(lang: str = "ru"):
         if lang in disabled:
             continue
         event = _localize_event(row, lang)
+        # Add attendees count
+        clicks = sb.table("event_clicks").select("id", count="exact").eq(
+            "event_id", row["id"]
+        ).execute()
+        event["attendees_count"] = clicks.count or 0
         events.append(event)
 
     return events
@@ -1104,6 +1137,154 @@ async def public_list_experts():
     sb = get_supabase()
     result = sb.table("experts").select("id, name, bio, avatar_url").execute()
     return result.data
+
+
+# === Quick Register (one-tap "I'm going") ===
+
+@public_router.post("/events/{event_id}/quick-register")
+@supabase_query
+async def quick_register_event(event_id: str, reg: QuickRegister):
+    """One-tap event registration by device_id (no form fields needed)"""
+    sb = get_supabase()
+
+    # Check event exists
+    event = sb.table("events").select("id, is_active").eq("id", event_id).execute()
+    if not event.data or not event.data[0].get("is_active"):
+        raise HTTPException(status_code=404, detail="Event not found or inactive")
+
+    # Check if already registered
+    existing = sb.table("event_clicks").select("id", count="exact").eq(
+        "event_id", event_id
+    ).eq("device_id", reg.device_id).execute()
+
+    if existing.count and existing.count > 0:
+        return {"status": "already_registered"}
+
+    # Register
+    sb.table("event_clicks").insert({
+        "event_id": event_id,
+        "device_id": reg.device_id,
+        "platform": reg.platform,
+    }).execute()
+
+    return {"status": "registered"}
+
+
+@public_router.get("/events/{event_id}/check-registration")
+@supabase_query
+async def check_event_registration(event_id: str, device_id: str):
+    """Check if device is registered for event"""
+    sb = get_supabase()
+    existing = sb.table("event_clicks").select("id", count="exact").eq(
+        "event_id", event_id
+    ).eq("device_id", device_id).execute()
+    return {"registered": bool(existing.count and existing.count > 0)}
+
+
+# === Content Reactions (like / dislike) ===
+
+@public_router.post("/articles/{article_id}/react")
+@supabase_query
+async def react_to_article(article_id: str, data: ContentReaction):
+    """Like or dislike an article. Upserts: replaces previous reaction."""
+    sb = get_supabase()
+
+    # Check if reaction exists
+    existing = sb.table("content_reactions").select("id, reaction").eq(
+        "content_type", "article"
+    ).eq("content_id", article_id).eq("device_id", data.device_id).execute()
+
+    if existing.data:
+        if existing.data[0]["reaction"] == data.reaction:
+            # Same reaction — remove it (toggle off)
+            sb.table("content_reactions").delete().eq("id", existing.data[0]["id"]).execute()
+            return {"status": "removed"}
+        else:
+            # Different reaction — update
+            sb.table("content_reactions").update(
+                {"reaction": data.reaction}
+            ).eq("id", existing.data[0]["id"]).execute()
+            return {"status": "updated"}
+    else:
+        # New reaction
+        sb.table("content_reactions").insert({
+            "content_type": "article",
+            "content_id": article_id,
+            "device_id": data.device_id,
+            "reaction": data.reaction,
+        }).execute()
+        return {"status": "created"}
+
+
+@public_router.post("/events/{event_id}/react")
+@supabase_query
+async def react_to_event(event_id: str, data: ContentReaction):
+    """Like or dislike an event. Upserts: replaces previous reaction."""
+    sb = get_supabase()
+
+    existing = sb.table("content_reactions").select("id, reaction").eq(
+        "content_type", "event"
+    ).eq("content_id", event_id).eq("device_id", data.device_id).execute()
+
+    if existing.data:
+        if existing.data[0]["reaction"] == data.reaction:
+            sb.table("content_reactions").delete().eq("id", existing.data[0]["id"]).execute()
+            return {"status": "removed"}
+        else:
+            sb.table("content_reactions").update(
+                {"reaction": data.reaction}
+            ).eq("id", existing.data[0]["id"]).execute()
+            return {"status": "updated"}
+    else:
+        sb.table("content_reactions").insert({
+            "content_type": "event",
+            "content_id": event_id,
+            "device_id": data.device_id,
+            "reaction": data.reaction,
+        }).execute()
+        return {"status": "created"}
+
+
+@public_router.get("/articles/{article_id}/reactions")
+@supabase_query
+async def get_article_reactions(article_id: str, device_id: str = ""):
+    """Get reaction counts and current user's reaction for an article"""
+    sb = get_supabase()
+    all_reactions = sb.table("content_reactions").select("reaction, device_id").eq(
+        "content_type", "article"
+    ).eq("content_id", article_id).execute()
+
+    likes = sum(1 for r in all_reactions.data if r["reaction"] == "like")
+    dislikes = sum(1 for r in all_reactions.data if r["reaction"] == "dislike")
+    my_reaction = None
+    if device_id:
+        for r in all_reactions.data:
+            if r["device_id"] == device_id:
+                my_reaction = r["reaction"]
+                break
+
+    return {"likes": likes, "dislikes": dislikes, "my_reaction": my_reaction}
+
+
+@public_router.get("/events/{event_id}/reactions")
+@supabase_query
+async def get_event_reactions(event_id: str, device_id: str = ""):
+    """Get reaction counts and current user's reaction for an event"""
+    sb = get_supabase()
+    all_reactions = sb.table("content_reactions").select("reaction, device_id").eq(
+        "content_type", "event"
+    ).eq("content_id", event_id).execute()
+
+    likes = sum(1 for r in all_reactions.data if r["reaction"] == "like")
+    dislikes = sum(1 for r in all_reactions.data if r["reaction"] == "dislike")
+    my_reaction = None
+    if device_id:
+        for r in all_reactions.data:
+            if r["device_id"] == device_id:
+                my_reaction = r["reaction"]
+                break
+
+    return {"likes": likes, "dislikes": dislikes, "my_reaction": my_reaction}
 
 
 # === Helper Functions ===
