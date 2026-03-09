@@ -657,23 +657,29 @@ BODY:
             logger.error(f"Generate article: failed to parse response. Title='{title}', body length={len(body)}")
             return
 
-        # Unsplash image
-        image_url = f"https://images.unsplash.com/photo-1510812431401-41d2bd2722f3?w=800&q=80"
-        # Try to get a relevant image
-        try:
-            import httpx
-            resp = httpx.get(
-                f"https://api.unsplash.com/search/photos",
-                params={"query": image_keyword, "per_page": 1, "orientation": "landscape"},
-                headers={"Authorization": "Client-ID YOUR_UNSPLASH_KEY"},
-                timeout=5
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("results"):
-                    image_url = data["results"][0]["urls"]["regular"]
-        except Exception:
-            pass  # Use default wine image
+        # Unsplash wine image pool — pick a random one, prefer unused
+        import random
+        WINE_PHOTO_POOL = [
+            "photo-1510812431401-41d2bd2722f3",  # wine glass close-up
+            "photo-1506377247377-2a5b3b417ebb",   # wine pouring
+            "photo-1474722883778-792e7990302f",   # wine bottles on shelf
+            "photo-1553361371-9b22f78e8b1d",   # wine cellar barrels
+            "photo-1516594915697-87eb3b1c14ea",   # red wine glass on table
+            "photo-1567529692333-de9fd6772897",   # vineyard landscape
+            "photo-1504279577054-acfeccf8fc52",   # wine tasting setup
+            "photo-1558642452-9d2a7deb7f62",   # wine and cheese pairing
+            "photo-1528823872057-9c018a7a7553",   # wine cork and bottle
+            "photo-1543418219-0e518d919e55",   # wine glasses cheers
+            "photo-1586370434639-0fe43b2d32e6",   # grapes on vine
+            "photo-1423483641154-5411ec9c0ddf",   # red wine close-up
+        ]
+        # Check which images are already used by existing articles
+        used_urls = set(a.get("image_url", "") for a in (existing.data or []))
+        available_photos = [p for p in WINE_PHOTO_POOL if f"https://images.unsplash.com/{p}?w=800&q=80" not in used_urls]
+        if not available_photos:
+            available_photos = WINE_PHOTO_POOL  # All used — reset pool
+        chosen_photo = random.choice(available_photos)
+        image_url = f"https://images.unsplash.com/{chosen_photo}?w=800&q=80"
 
         # Save article (as draft)
         insert_data = {
