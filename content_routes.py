@@ -605,6 +605,7 @@ async def _generate_article_task(api_key: str):
 - С использованием **жирного** и *курсивного* текста для выделения ключевых моментов (markdown)
 - Написана простым и дружелюбным языком, без снобизма
 - Про конкретную тему (сорта винограда, регионы Испании, сочетания с едой, сезонные рекомендации, как выбрать вино по случаю, и т.д.)
+- ВАЖНО: между абзацами ОБЯЗАТЕЛЬНО оставляй пустую строку (двойной перенос). Каждый подзаголовок должен быть на отдельной строке с пустыми строками до и после него. Текст должен быть хорошо структурирован и легко читаем.
 
 Уже существующие статьи (НЕ повторяй их темы):
 {titles_list}
@@ -641,6 +642,16 @@ BODY:
                 body_lines.append(line)
 
         body = "\n".join(body_lines).strip()
+
+        # Post-process: ensure proper paragraph breaks for markdown rendering
+        # CommonMark treats single \n as soft break (space), need \n\n for paragraphs
+        import re
+        # Normalize: any sequence of 1+ newlines → exactly \n\n (paragraph break)
+        body = re.sub(r'\n{1,}', '\n\n', body)
+        # Ensure blank line before bold headers like **Заголовок**
+        body = re.sub(r'([^\n])\n\n(\*\*)', r'\1\n\n\2', body)
+        # Remove leading/trailing whitespace
+        body = body.strip()
 
         if not title or not body:
             logger.error(f"Generate article: failed to parse response. Title='{title}', body length={len(body)}")
