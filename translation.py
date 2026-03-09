@@ -34,6 +34,30 @@ REQUEST_TIMEOUT = 10.0
 MAX_CHUNK_CHARS = 1500
 
 
+async def check_quota() -> bool:
+    """Quick check if MyMemory quota is still available.
+    Returns True if quota OK, False if exhausted (429).
+    """
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            resp = await client.post(
+                MYMEMORY_URL,
+                data={
+                    "q": "тест",
+                    "langpair": "ru-RU|en-GB",
+                    "de": MYMEMORY_EMAIL,
+                }
+            )
+            data = resp.json()
+            if data.get("responseStatus") == 429:
+                logger.error("MyMemory daily quota exhausted!")
+                return False
+            return True
+    except Exception as e:
+        logger.error(f"Quota check failed: {e}")
+        return True  # assume OK on error, let real translation handle it
+
+
 async def translate_text(text: str, source_lang: str, target_lang: str) -> str | None:
     """
     Translate a single text chunk using MyMemory API (POST to avoid URL length limits).
@@ -62,9 +86,17 @@ async def translate_text(text: str, source_lang: str, target_lang: str) -> str |
             )
             data = response.json()
 
-            if data.get("responseStatus") != 200:
+            status = data.get("responseStatus")
+            if status == 429:
+                logger.error(
+                    f"MyMemory QUOTA EXHAUSTED for {langpair}: "
+                    f"daily limit reached. Translation will resume tomorrow."
+                )
+                return None
+
+            if status != 200:
                 logger.warning(
-                    f"MyMemory error for {langpair}: status={data.get('responseStatus')}, "
+                    f"MyMemory error for {langpair}: status={status}, "
                     f"text_len={len(text)}, response={str(data)[:200]}"
                 )
                 return None
