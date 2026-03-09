@@ -829,6 +829,12 @@ async def article_views_stats(user: AdminUser = Depends(require_admin)):
         "id, title, is_published, created_at"
     ).order("created_at", desc=True).execute()
 
+    # Global unique readers (distinct device_id across ALL article views)
+    all_views = sb.table("article_views").select("device_id").execute()
+    total_unique = len(set(
+        v["device_id"] for v in all_views.data if v.get("device_id")
+    ))
+
     stats = []
     for article in articles.data:
         # Total views
@@ -853,7 +859,7 @@ async def article_views_stats(user: AdminUser = Depends(require_admin)):
             "unique_viewers": unique_count,
         })
 
-    return stats
+    return {"stats": stats, "total_unique_readers": total_unique}
 
 
 @admin_router.get("/event-views/stats")
@@ -865,6 +871,12 @@ async def event_views_stats(user: AdminUser = Depends(require_admin)):
     events = sb.table("events").select(
         "id, title, event_date, is_active"
     ).order("event_date", desc=True).execute()
+
+    # Global unique viewers (distinct device_id across ALL event views)
+    all_views = sb.table("event_views").select("device_id").execute()
+    total_unique = len(set(
+        v["device_id"] for v in all_views.data if v.get("device_id")
+    ))
 
     stats = []
     for event in events.data:
@@ -896,7 +908,7 @@ async def event_views_stats(user: AdminUser = Depends(require_admin)):
             "registration_count": clicks.count or 0,
         })
 
-    return stats
+    return {"stats": stats, "total_unique_viewers": total_unique}
 
 
 # === Public Endpoints (for mobile apps & website) ===
