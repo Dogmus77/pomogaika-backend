@@ -552,6 +552,42 @@ async def translate_article_manual(
     }
 
 
+@admin_router.post("/articles/{article_id}/translate-sync")
+async def translate_article_sync_test(
+    article_id: str,
+    user: AdminUser = Depends(get_current_user)
+):
+    """DEBUG: Run translation synchronously (await directly, not in background).
+    This helps isolate whether the issue is background task execution or translation itself.
+    """
+    sb = get_supabase()
+    result = sb.table("articles").select("*").eq("id", article_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Article not found")
+
+    article = result.data[0]
+    logger.info(f"SYNC translate: article {article_id}, lang={article['language']}, body_len={len(article['body'])}")
+
+    try:
+        translations = await translate_article(article["title"], article["body"], article["language"])
+        logger.info(f"SYNC translate result: {list(translations.keys()) if translations else 'EMPTY'}")
+
+        if translations:
+            sb.table("articles").update(
+                {"translations": translations}
+            ).eq("id", article_id).execute()
+            return {
+                "status": "ok",
+                "languages": list(translations.keys()),
+                "count": len(translations),
+            }
+        else:
+            return {"status": "empty", "languages": [], "count": 0}
+    except Exception as e:
+        logger.error(f"SYNC translate error: {e}", exc_info=True)
+        return {"status": "error", "error": str(e)}
+
+
 @admin_router.post("/articles/{article_id}/refresh")
 @supabase_query
 async def refresh_article(
