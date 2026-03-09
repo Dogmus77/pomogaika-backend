@@ -17,6 +17,9 @@ from translation import translate_article, translate_event
 
 logger = logging.getLogger(__name__)
 
+# Set to hold references to background asyncio tasks (prevents garbage collection)
+_background_tasks: set = set()
+
 # === Routers ===
 
 admin_router = APIRouter(prefix="/admin", tags=["admin"])
@@ -465,10 +468,13 @@ async def create_article(
 
     # Auto-translate if published
     if article.is_published:
-        background_tasks.add_task(
-            _translate_article_task, new_article["id"],
-            article.title, article.body, article.language
+        import asyncio
+        task = asyncio.create_task(
+            _translate_article_task_async(new_article["id"],
+            article.title, article.body, article.language)
         )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
     return new_article
 
@@ -494,10 +500,13 @@ async def update_article(
     # Re-translate if content changed and article is published
     needs_translation = (article.title or article.body) and updated.get("is_published")
     if needs_translation:
-        background_tasks.add_task(
-            _translate_article_task, article_id,
-            updated["title"], updated["body"], updated["language"]
+        import asyncio
+        task = asyncio.create_task(
+            _translate_article_task_async(article_id,
+            updated["title"], updated["body"], updated["language"])
         )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
     return updated
 
@@ -517,20 +526,24 @@ async def delete_article(
 @admin_router.post("/articles/{article_id}/translate")
 async def translate_article_manual(
     article_id: str,
-    background_tasks: BackgroundTasks,
     user: AdminUser = Depends(get_current_user)
 ):
-    """Manually trigger translation for an article (runs in background)"""
+    """Manually trigger translation for an article (runs in background via asyncio task)"""
     sb = get_supabase()
     result = sb.table("articles").select("*").eq("id", article_id).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Article not found")
 
     article = result.data[0]
-    background_tasks.add_task(
-        _translate_article_task, article["id"],
-        article["title"], article["body"], article["language"]
+    # Use asyncio.create_task instead of BackgroundTasks (more reliable for async work)
+    import asyncio
+    task = asyncio.create_task(
+        _translate_article_task_async(article["id"],
+        article["title"], article["body"], article["language"])
     )
+    # Store reference to prevent garbage collection
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     return {
         "status": "translation_started",
@@ -781,10 +794,13 @@ async def create_event(
     new_event = result.data[0]
 
     # Auto-translate
-    background_tasks.add_task(
-        _translate_event_task, new_event["id"],
-        event.title, event.description, event.language
+    import asyncio
+    task = asyncio.create_task(
+        _translate_event_task_async(new_event["id"],
+        event.title, event.description, event.language)
     )
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     return new_event
 
@@ -815,10 +831,13 @@ async def update_event(
 
     # Re-translate if content changed
     if event.title or event.description:
-        background_tasks.add_task(
-            _translate_event_task, event_id,
-            updated["title"], updated.get("description"), updated["language"]
+        import asyncio
+        task = asyncio.create_task(
+            _translate_event_task_async(event_id,
+            updated["title"], updated.get("description"), updated["language"])
         )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
     return updated
 
@@ -838,20 +857,22 @@ async def delete_event(
 @admin_router.post("/events/{event_id}/translate")
 async def translate_event_manual(
     event_id: str,
-    background_tasks: BackgroundTasks,
     user: AdminUser = Depends(get_current_user)
 ):
-    """Manually trigger translation for an event (runs in background)"""
+    """Manually trigger translation for an event (runs in background via asyncio task)"""
     sb = get_supabase()
     result = sb.table("events").select("*").eq("id", event_id).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Event not found")
 
     event = result.data[0]
-    background_tasks.add_task(
-        _translate_event_task, event["id"],
-        event["title"], event.get("description"), event["language"]
+    import asyncio
+    task = asyncio.create_task(
+        _translate_event_task_async(event["id"],
+        event["title"], event.get("description"), event["language"])
     )
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     return {
         "status": "translation_started",
@@ -1496,46 +1517,42 @@ def _localize_event(row: dict, lang: str) -> dict:
 
 # === Background Tasks ===
 
-def _translate_article_task(article_id: str, title: str, body: str, language: str):
-    """Background task: translate article and save to DB.
-    Uses sync wrapper with own event loop (async BackgroundTasks unreliable on some ASGI servers).
+async def _translate_article_task_async(article_id: str, title: str, body: str, language: str):
+    """Async background task: translate article and save to DB.
+    Called via asyncio.create_task() from endpoints.
     """
-    import asyncio
     try:
-        loop = asyncio.new_event_loop()
-        translations = loop.run_until_complete(translate_article(title, body, language))
-        loop.close()
+        logger.info(f"Starting translation for article {article_id} (body_len={len(body)})...")
+        translations = await translate_article(title, body, language)
         if translations:
             sb = get_supabase()
             sb.table("articles").update(
                 {"translations": translations}
             ).eq("id", article_id).execute()
-            logger.info(f"Background translation completed for article {article_id}: {list(translations.keys())}")
+            logger.info(f"Translation completed for article {article_id}: {list(translations.keys())}")
         else:
-            logger.warning(f"Background translation returned empty for article {article_id}")
+            logger.warning(f"Translation returned empty for article {article_id}")
     except Exception as e:
-        logger.error(f"Background translation failed for article {article_id}: {e}")
+        logger.error(f"Translation failed for article {article_id}: {e}", exc_info=True)
 
 
-def _translate_event_task(event_id: str, title: str, description: str | None, language: str):
-    """Background task: translate event and save to DB.
-    Uses sync wrapper with own event loop (async BackgroundTasks unreliable on some ASGI servers).
+async def _translate_event_task_async(event_id: str, title: str, description: str | None, language: str):
+    """Async background task: translate event and save to DB.
+    Called via asyncio.create_task() from endpoints.
     """
-    import asyncio
     try:
-        loop = asyncio.new_event_loop()
-        translations = loop.run_until_complete(translate_event(title, description, language))
-        loop.close()
+        logger.info(f"Starting translation for event {event_id}...")
+        translations = await translate_event(title, description, language)
         if translations:
             sb = get_supabase()
             sb.table("events").update(
                 {"translations": translations}
             ).eq("id", event_id).execute()
-            logger.info(f"Background translation completed for event {event_id}: {list(translations.keys())}")
+            logger.info(f"Translation completed for event {event_id}: {list(translations.keys())}")
         else:
-            logger.warning(f"Background translation returned empty for event {event_id}")
+            logger.warning(f"Translation returned empty for event {event_id}")
     except Exception as e:
-        logger.error(f"Background translation failed for event {event_id}: {e}")
+        logger.error(f"Translation failed for event {event_id}: {e}", exc_info=True)
 
 
 async def _send_registration_email(event_title: str, registration_data: dict, to_email: str):
