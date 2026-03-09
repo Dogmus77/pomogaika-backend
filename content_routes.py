@@ -68,6 +68,7 @@ class EventUpdate(BaseModel):
     image_url: Optional[str] = None
     language: Optional[str] = None
     is_active: Optional[bool] = None
+    disabled_languages: Optional[list] = None
 
 
 class EventRegister(BaseModel):
@@ -505,6 +506,33 @@ async def refresh_article(
     return {"status": "refreshed", "article_id": article_id}
 
 
+class TranslationUpdate(BaseModel):
+    title: str
+    body: Optional[str] = None
+    description: Optional[str] = None
+
+
+@admin_router.put("/articles/{article_id}/translations/{lang}")
+@supabase_query
+async def update_article_translation(
+    article_id: str,
+    lang: str,
+    data: TranslationUpdate,
+    user: AdminUser = Depends(get_current_user)
+):
+    """Update a specific language translation for an article"""
+    sb = get_supabase()
+    result = sb.table("articles").select("translations").eq("id", article_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Article not found")
+
+    translations = result.data[0].get("translations") or {}
+    translations[lang] = {"title": data.title, "body": data.body or ""}
+
+    sb.table("articles").update({"translations": translations}).eq("id", article_id).execute()
+    return {"status": "updated", "lang": lang}
+
+
 # === Events Endpoints ===
 
 @admin_router.get("/events")
@@ -625,6 +653,78 @@ async def translate_event_manual(
     }
 
 
+@admin_router.put("/events/{event_id}/translations/{lang}")
+@supabase_query
+async def update_event_translation(
+    event_id: str,
+    lang: str,
+    data: TranslationUpdate,
+    user: AdminUser = Depends(get_current_user)
+):
+    """Update a specific language translation for an event"""
+    sb = get_supabase()
+    result = sb.table("events").select("translations").eq("id", event_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    translations = result.data[0].get("translations") or {}
+    translations[lang] = {"title": data.title, "description": data.description or ""}
+
+    sb.table("events").update({"translations": translations}).eq("id", event_id).execute()
+    return {"status": "updated", "lang": lang}
+
+
+@admin_router.post("/events/{event_id}/refresh")
+@supabase_query
+async def refresh_event(
+    event_id: str,
+    user: AdminUser = Depends(get_current_user)
+):
+    """Mark event as 'new' by updating refreshed_at timestamp"""
+    sb = get_supabase()
+    result = sb.table("events").update(
+        {"refreshed_at": datetime.utcnow().isoformat()}
+    ).eq("id", event_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Event not found")
+    return {"status": "refreshed", "event_id": event_id}
+
+
+@admin_router.post("/events/{event_id}/duplicate")
+@supabase_query
+async def duplicate_event(
+    event_id: str,
+    user: AdminUser = Depends(get_current_user)
+):
+    """Duplicate an event with '(копия)' suffix, set inactive"""
+    sb = get_supabase()
+    result = sb.table("events").select("*").eq("id", event_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    original = result.data[0]
+    new_event = {
+        "title": original["title"] + " (копия)",
+        "description": original.get("description"),
+        "event_date": original["event_date"],
+        "telegram_url": original.get("telegram_url"),
+        "landing_url": original.get("landing_url"),
+        "image_url": original.get("image_url"),
+        "language": original.get("language", "ru"),
+        "is_active": False,
+        "translations": original.get("translations"),
+        "registration_fields": original.get("registration_fields"),
+        "notification_email": original.get("notification_email"),
+        "disabled_languages": original.get("disabled_languages", []),
+    }
+
+    insert_result = sb.table("events").insert(new_event).execute()
+    if not insert_result.data:
+        raise HTTPException(status_code=500, detail="Failed to duplicate event")
+
+    return insert_result.data[0]
+
+
 # === Event Clicks (admin stats) ===
 
 @admin_router.get("/event-clicks")
@@ -738,6 +838,10 @@ async def public_active_events(lang: str = "ru"):
 
     events = []
     for row in result.data:
+        # Skip if event is disabled for this language
+        disabled = row.get("disabled_languages") or []
+        if lang in disabled:
+            continue
         event = _localize_event(row, lang)
         events.append(event)
 
@@ -831,6 +935,8 @@ def _localize_event(row: dict, lang: str) -> dict:
         "landing_url": row.get("landing_url"),
         "image_url": row.get("image_url"),
         "is_active": row.get("is_active"),
+        "refreshed_at": row.get("refreshed_at"),
+        "registration_fields": row.get("registration_fields"),
     }
 
 
