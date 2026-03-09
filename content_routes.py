@@ -528,10 +528,10 @@ async def translate_article_manual(
     article_id: str,
     user: AdminUser = Depends(get_current_user)
 ):
-    """Manually trigger translation for an article.
-    First checks MyMemory quota, then runs synchronously (more reliable than background tasks).
+    """Manually trigger translation for an article (async background).
+    Checks quota first, then launches background task.
     """
-    # Check quota first
+    # Quick quota check (fast — single short API call)
     quota_ok = await check_quota()
     if not quota_ok:
         raise HTTPException(
@@ -545,31 +545,19 @@ async def translate_article_manual(
         raise HTTPException(status_code=404, detail="Article not found")
 
     article = result.data[0]
+    import asyncio
+    task = asyncio.create_task(
+        _translate_article_task_async(article["id"],
+        article["title"], article["body"], article["language"])
+    )
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
-    # Run translation synchronously — more reliable than background tasks
-    try:
-        translations = await translate_article(
-            article["title"], article["body"], article["language"]
-        )
-        if translations:
-            sb.table("articles").update(
-                {"translations": translations}
-            ).eq("id", article_id).execute()
-            return {
-                "status": "ok",
-                "message": f"Переведено на {len(translations)} языков: {', '.join(translations.keys())}",
-                "article_id": article_id,
-                "languages": list(translations.keys()),
-            }
-        else:
-            return {
-                "status": "empty",
-                "message": "Перевод не удался. Возможно, исчерпан лимит MyMemory.",
-                "article_id": article_id,
-            }
-    except Exception as e:
-        logger.error(f"Manual translate failed for article {article_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Ошибка перевода: {str(e)}")
+    return {
+        "status": "translation_started",
+        "message": "Перевод запущен в фоне. Обновите страницу через 30-60 секунд.",
+        "article_id": article_id,
+    }
 
 
 @admin_router.post("/articles/{article_id}/translate-sync")
@@ -941,10 +929,10 @@ async def translate_event_manual(
     event_id: str,
     user: AdminUser = Depends(get_current_user)
 ):
-    """Manually trigger translation for an event.
-    First checks MyMemory quota, then runs synchronously.
+    """Manually trigger translation for an event (async background).
+    Checks quota first, then launches background task.
     """
-    # Check quota first
+    # Quick quota check
     quota_ok = await check_quota()
     if not quota_ok:
         raise HTTPException(
@@ -958,30 +946,19 @@ async def translate_event_manual(
         raise HTTPException(status_code=404, detail="Event not found")
 
     event = result.data[0]
+    import asyncio
+    task = asyncio.create_task(
+        _translate_event_task_async(event["id"],
+        event["title"], event.get("description"), event["language"])
+    )
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
-    try:
-        translations = await translate_event(
-            event["title"], event.get("description"), event["language"]
-        )
-        if translations:
-            sb.table("events").update(
-                {"translations": translations}
-            ).eq("id", event_id).execute()
-            return {
-                "status": "ok",
-                "message": f"Переведено на {len(translations)} языков: {', '.join(translations.keys())}",
-                "event_id": event_id,
-                "languages": list(translations.keys()),
-            }
-        else:
-            return {
-                "status": "empty",
-                "message": "Перевод не удался. Возможно, исчерпан лимит MyMemory.",
-                "event_id": event_id,
-            }
-    except Exception as e:
-        logger.error(f"Manual translate failed for event {event_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Ошибка перевода: {str(e)}")
+    return {
+        "status": "translation_started",
+        "message": "Перевод запущен в фоне. Обновите страницу через 30-60 секунд.",
+        "event_id": event_id,
+    }
 
 
 @admin_router.put("/events/{event_id}/translations/{lang}")
