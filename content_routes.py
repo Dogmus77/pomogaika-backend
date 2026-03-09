@@ -314,25 +314,38 @@ async def update_user_role(
 # === Image Upload ===
 
 @admin_router.post("/upload/image")
-@supabase_query
 async def upload_image(
     file: UploadFile = File(...),
     type: str = QueryParam("article", description="article, avatar, or event"),
     user: AdminUser = Depends(get_current_user)
 ):
-    """Upload and resize an image, store in Supabase Storage"""
+    """Upload and resize an image, store in Supabase Storage.
+    NOTE: No @supabase_query decorator here — file stream can only be read once,
+    so retry logic would fail on the second attempt with empty bytes.
+    """
     import os
     from PIL import Image
 
+    logger.info(f"Upload image request: type={type}, filename={file.filename}, content_type={file.content_type}")
+
     # Validate file type
-    allowed_types = {"image/jpeg", "image/png", "image/webp"}
-    if file.content_type not in allowed_types:
+    allowed_types = {"image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"}
+    if file.content_type and file.content_type not in allowed_types:
         raise HTTPException(status_code=400, detail=f"File type {file.content_type} not allowed. Use JPEG, PNG or WebP.")
 
     # Read file (max 10MB)
-    contents = await file.read()
+    try:
+        contents = await file.read()
+    except Exception as e:
+        logger.error(f"Failed to read uploaded file: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to read file: {str(e)}")
+
+    if len(contents) == 0:
+        raise HTTPException(status_code=400, detail="Empty file uploaded")
     if len(contents) > 10 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="File too large (max 10MB)")
+
+    logger.info(f"File read OK: {len(contents)} bytes")
 
     # Process with Pillow
     try:
@@ -357,7 +370,9 @@ async def upload_image(
         buffer = io.BytesIO()
         img.save(buffer, format="JPEG", quality=85)
         image_bytes = buffer.getvalue()
+        logger.info(f"Image processed OK: {img.width}x{img.height} -> {len(image_bytes)} bytes JPEG")
     except Exception as e:
+        logger.error(f"Image processing failed: {e}")
         raise HTTPException(status_code=400, detail=f"Image processing failed: {str(e)}")
 
     # Upload to Supabase Storage
@@ -370,8 +385,23 @@ async def upload_image(
             file=image_bytes,
             file_options={"content-type": "image/jpeg"}
         )
+        logger.info(f"Storage upload OK: {file_path}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Storage upload failed: {str(e)}")
+        logger.error(f"Storage upload failed: {e}")
+        # Try with fresh client once
+        try:
+            from supabase_client import reset_supabase
+            reset_supabase()
+            sb = get_supabase()
+            sb.storage.from_("content-images").upload(
+                path=file_path,
+                file=image_bytes,
+                file_options={"content-type": "image/jpeg"}
+            )
+            logger.info(f"Storage upload OK on retry: {file_path}")
+        except Exception as e2:
+            logger.error(f"Storage upload failed on retry: {e2}")
+            raise HTTPException(status_code=500, detail=f"Storage upload failed: {str(e2)}")
 
     # Build public URL
     supabase_url = os.environ.get("SUPABASE_URL", "")
