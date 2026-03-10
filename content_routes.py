@@ -1356,7 +1356,7 @@ async def public_register_event(
                     detail=f"Field '{field_name}' is required"
                 )
 
-    # Record registration
+    # Check for existing registration from this device (e.g. quick-register "I'm going")
     click_data = {
         "event_id": event_id,
         "user_name": reg.user_name,
@@ -1366,7 +1366,23 @@ async def public_register_event(
         "device_id": reg.device_id,
         "platform": reg.platform,
     }
-    sb.table("event_clicks").insert(click_data).execute()
+
+    if reg.device_id:
+        existing = sb.table("event_clicks").select("id").eq(
+            "event_id", event_id
+        ).eq("device_id", reg.device_id).execute()
+        if existing.data:
+            # Update existing record with form data (enrich quick-register)
+            sb.table("event_clicks").update({
+                "user_name": reg.user_name,
+                "user_surname": reg.user_surname,
+                "email": reg.email,
+                "phone": reg.phone,
+            }).eq("id", existing.data[0]["id"]).execute()
+        else:
+            sb.table("event_clicks").insert(click_data).execute()
+    else:
+        sb.table("event_clicks").insert(click_data).execute()
 
     # Send notification email in background
     notification_email = event_data.get("notification_email")
