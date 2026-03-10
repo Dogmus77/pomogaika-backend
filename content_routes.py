@@ -1345,11 +1345,14 @@ async def public_register_event(
     event_data = event.data[0]
 
     # Validate required fields from registration_fields config
+    # Map config field names to model attribute names
+    field_to_attr = {"name": "user_name", "surname": "user_surname", "email": "email", "phone": "phone"}
     reg_fields = event_data.get("registration_fields") or []
     for field_config in reg_fields:
         field_name = field_config.get("field")
         if field_config.get("required"):
-            value = getattr(reg, field_name, None) if field_name else None
+            attr_name = field_to_attr.get(field_name, field_name)
+            value = getattr(reg, attr_name, None) if attr_name else None
             if not value:
                 raise HTTPException(
                     status_code=400,
