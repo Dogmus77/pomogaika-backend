@@ -24,6 +24,7 @@ class Store(Enum):
     MASYMAS = "masymas"
     DIA = "dia"
     CONDIS = "condis"
+    FROIZ = "froiz"
 
 
 @dataclass
@@ -1102,6 +1103,192 @@ class CondisParser:
         return None
 
 
+class FroizParser:
+    """
+    Parser for supermercado.froiz.com
+    Uses public REST API at servicios.froiz.com — clean JSON, no auth required.
+    """
+
+    API_URL = "https://servicios.froiz.com/api/products"
+    IMAGE_CDN = "https://froiz.com/cdn-cgi/imagedelivery/laxGYDNZyT04iZVpzPzryw"
+    SITE_URL = "https://supermercado.froiz.com"
+
+    def __init__(self, postal_code: str = "36005"):
+        self.postal_code = postal_code
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            "Accept": "application/json",
+        })
+
+    def search_wines(self, wine_type: WineType = WineType.TINTO, limit: int = 50, custom_query: str = None) -> list[Wine]:
+        """Search wines via Froiz REST API"""
+        query = custom_query if custom_query else f"vino {wine_type.value}"
+
+        params = {
+            "postalCode": self.postal_code,
+            "term": query,
+            "page": 1,
+            "size": min(limit, 40),
+        }
+
+        try:
+            response = self.session.get(self.API_URL, params=params, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+
+            products = data.get("products", [])
+            wines = []
+            for product in products:
+                wine = self._parse_product(product, wine_type)
+                if wine:
+                    wines.append(wine)
+
+            print(f"\u2705 Froiz: {len(wines)} wines (from {len(products)} products)")
+            return wines
+
+        except requests.RequestException as e:
+            print(f"\u274C Froiz API error: {e}")
+            return []
+        except Exception as e:
+            print(f"\u274C Froiz parsing error: {e}")
+            return []
+
+    def _parse_product(self, product: dict, search_type: WineType) -> Optional[Wine]:
+        """Parse Froiz API product into Wine object"""
+        try:
+            product_id = str(product.get("id", ""))
+            name = product.get("name", "")
+            if not name:
+                return None
+
+            # Skip non-wine products
+            name_lower = name.lower()
+            exclude_words = [
+                "vinagre", "sangr\u00EDa", "mosto", "refresco", "zumo",
+                "cafe", "capsula", "nespresso", "pimienta", "pimiento", "especias",
+                "jamon", "queso", "aceite", "sal ", "azucar",
+            ]
+            if any(w in name_lower for w in exclude_words):
+                return None
+
+            brand = product.get("brand_name", "")
+
+            # Price
+            base_price_str = product.get("base_price", "0")
+            order_price_str = product.get("order_price", "0")
+            base_price = float(base_price_str) if base_price_str else 0
+            order_price = float(order_price_str) if order_price_str else 0
+
+            price = base_price if base_price > 0 else order_price
+            if price == 0:
+                return None
+
+            # Discount
+            discount_price = None
+            discount_percent = None
+            if order_price > 0 and base_price > 0 and order_price < base_price:
+                discount_price = order_price
+                discount_percent = int((1 - order_price / base_price) * 100)
+
+            # Price per liter — estimate from 75cl bottle
+            price_per_liter = round(price / 0.75, 2)
+
+            # Image
+            image_id = product.get("image_id", "")
+            image_url = f"{self.IMAGE_CDN}/{image_id}/desktop" if image_id else None
+
+            # URL
+            slug = product.get("slug", "")
+            url = f"{self.SITE_URL}/product/{slug}" if slug else f"{self.SITE_URL}"
+
+            # Region from family_name (e.g. "D.o. rioja")
+            family = product.get("family_name", "")
+            region = self._extract_region_from_family(family)
+            if not region:
+                region = self._extract_region(name)
+
+            # Wine type
+            wine_type_val = self._extract_wine_type(name)
+            if not wine_type_val:
+                wine_type_val = search_type.value
+
+            return Wine(
+                id=f"froiz_{product_id}",
+                name=name,
+                brand=brand,
+                price=price,
+                price_per_liter=price_per_liter,
+                store=Store.FROIZ.value,
+                url=url,
+                image_url=image_url,
+                region=region,
+                wine_type=wine_type_val,
+                discount_price=discount_price,
+                discount_percent=discount_percent,
+            )
+        except Exception as e:
+            print(f"\u274C Froiz parse error: {e}")
+            return None
+
+    def _extract_region_from_family(self, family: str) -> Optional[str]:
+        """Extract D.O. region from Froiz family_name field"""
+        if not family:
+            return None
+        family_lower = family.lower()
+        region_map = {
+            "rioja": "Rioja",
+            "ribera del duero": "Ribera del Duero",
+            "rias baixas": "R\u00EDas Baixas",
+            "ribeiro": "Ribeiro",
+            "rueda": "Rueda",
+            "valdeorras": "Valdeorras",
+            "bierzo": "Bierzo",
+            "la mancha": "La Mancha",
+            "somontano": "Somontano",
+            "jumilla": "Jumilla",
+            "toro": "Toro",
+            "cigales": "Cigales",
+            "navarra": "Navarra",
+            "valdepe\u00F1as": "Valdepe\u00F1as",
+            "priorat": "Priorat",
+            "pened\u00E8s": "Pened\u00E8s",
+        }
+        for key, region in region_map.items():
+            if key in family_lower:
+                return region
+        return None
+
+    def _extract_region(self, name: str) -> Optional[str]:
+        """Extract DO region from wine name"""
+        regions = [
+            "Rioja", "Ribera del Duero", "Rueda", "R\u00EDas Baixas",
+            "Ribeiro", "Valdeorras", "Bierzo", "Priorat", "Pened\u00E8s",
+            "Jumilla", "Toro", "Navarra", "La Mancha", "Valdepe\u00F1as",
+            "Somontano", "Campo de Borja", "Yecla", "Cigales",
+        ]
+        name_lower = name.lower()
+        for region in regions:
+            if region.lower() in name_lower:
+                return region
+        return None
+
+    def _extract_wine_type(self, name: str) -> Optional[str]:
+        """Extract wine type from name"""
+        name_lower = name.lower()
+        if "tinto" in name_lower:
+            return WineType.TINTO.value
+        elif "blanco" in name_lower:
+            return WineType.BLANCO.value
+        elif "rosado" in name_lower:
+            return WineType.ROSADO.value
+        elif "cava" in name_lower:
+            return WineType.CAVA.value
+        elif "espumoso" in name_lower:
+            return WineType.ESPUMOSO.value
+        return None
+
+
 class WineAggregator:
     """
     Wine aggregator from all stores.
@@ -1115,7 +1302,8 @@ class WineAggregator:
         self.masymas = MasymasParser(postal_code)
         self.dia = DIAParser(postal_code)
         self.condis = CondisParser(postal_code)
-        self._parsers = [self.consum, self.mercadona, self.masymas, self.dia, self.condis]
+        self.froiz = FroizParser(postal_code)
+        self._parsers = [self.consum, self.mercadona, self.masymas, self.dia, self.condis, self.froiz]
     
     def search_all(self, wine_type: WineType = WineType.TINTO, limit_per_store: int = 20) -> list[Wine]:
         """Search wines across all stores IN PARALLEL"""
