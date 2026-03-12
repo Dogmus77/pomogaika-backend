@@ -69,6 +69,19 @@ async def _warmup_cache():
         cache_ready.set()
 
 
+# === App Version Check ===
+
+_LATEST_VERSIONS = {
+    "ios": "1.2.0",
+    "android": "1.2.0"
+}
+
+@app.get("/version")
+async def get_latest_version():
+    """Returns latest app versions for update checks"""
+    return _LATEST_VERSIONS
+
+
 # === Models ===
 
 class WineResponse(BaseModel):
