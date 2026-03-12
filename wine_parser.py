@@ -254,8 +254,14 @@ class ConsumParser:
             
             url = f"https://tienda.consum.es/es/p/{slug}/{product_id}" if slug else f"https://tienda.consum.es/es/p/{product_id}"
             
+            # Image: prefer media[] array (Consum moved images there, imageURL now 404)
             image_url = ""
-            if isinstance(product_data, dict):
+            media_list = item.get("media", [])
+            if isinstance(media_list, list) and media_list:
+                first_media = media_list[0]
+                if isinstance(first_media, dict):
+                    image_url = first_media.get("url", "")
+            if not image_url and isinstance(product_data, dict):
                 img = product_data.get("imageURL", product_data.get("image", ""))
                 if isinstance(img, dict):
                     image_url = img.get("url", img.get("src", ""))
