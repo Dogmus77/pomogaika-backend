@@ -14,6 +14,7 @@ import logging
 from supabase_client import get_supabase, supabase_query
 from auth import AdminUser, get_current_user, require_admin
 from translation import translate_article, translate_event, check_quota
+from push_notifications import notify_new_article, notify_new_event, send_push_async
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,20 @@ class QuickRegister(BaseModel):
 class ContentReaction(BaseModel):
     device_id: str
     reaction: str  # "like" or "dislike"
+
+
+class DeviceTokenRegister(BaseModel):
+    device_id: str
+    fcm_token: str
+    platform: str  # "ios" or "android"
+    language: Optional[str] = "ru"
+
+
+class PushNotificationRequest(BaseModel):
+    title: str
+    body: str
+    content_type: Optional[str] = None  # "article" or "event"
+    content_id: Optional[str] = None
 
 
 class ExpertCreate(BaseModel):
@@ -1559,6 +1574,43 @@ async def get_event_reactions(event_id: str, device_id: str = ""):
                 break
 
     return {"likes": likes, "dislikes": dislikes, "my_reaction": my_reaction}
+
+
+# === Push Notification Endpoints ===
+
+@public_router.post("/device-token")
+async def register_device_token(data: DeviceTokenRegister):
+    """Register or update FCM push token for a device"""
+    if data.platform not in ("ios", "android"):
+        raise HTTPException(status_code=400, detail="Platform must be 'ios' or 'android'")
+
+    sb = get_supabase()
+    # Upsert: update token if device_id exists, insert otherwise
+    sb.table("device_tokens").upsert(
+        {
+            "device_id": data.device_id,
+            "fcm_token": data.fcm_token,
+            "platform": data.platform,
+            "language": data.language or "ru",
+        },
+        on_conflict="device_id",
+    ).execute()
+
+    return {"status": "registered"}
+
+
+@admin_router.post("/push/send")
+async def admin_send_push(
+    req: PushNotificationRequest,
+    user: AdminUser = Depends(require_admin)
+):
+    """Send push notification to all devices (admin only)"""
+    data = {}
+    if req.content_type and req.content_id:
+        data = {"type": req.content_type, f"{req.content_type}_id": req.content_id}
+
+    result = await send_push_async(req.title, req.body, data)
+    return result
 
 
 # === Helper Functions ===

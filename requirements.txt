@@ -8,3 +8,4 @@ supabase>=2.0.0,<3.0.0
 Pillow>=10.0.0
 python-multipart>=0.0.6
 anthropic>=0.40.0
+firebase-admin>=6.0.0
