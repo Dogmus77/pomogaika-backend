@@ -1433,30 +1433,8 @@ async def public_list_experts():
 @public_router.post("/events/{event_id}/quick-register")
 @supabase_query
 async def quick_register_event(event_id: str, reg: QuickRegister):
-    """One-tap event registration by device_id (no form fields needed)"""
-    sb = get_supabase()
-
-    # Check event exists
-    event = sb.table("events").select("id, is_active").eq("id", event_id).execute()
-    if not event.data or not event.data[0].get("is_active"):
-        raise HTTPException(status_code=404, detail="Event not found or inactive")
-
-    # Check if already registered
-    existing = sb.table("event_clicks").select("id", count="exact").eq(
-        "event_id", event_id
-    ).eq("device_id", reg.device_id).execute()
-
-    if existing.count and existing.count > 0:
-        return {"status": "already_registered"}
-
-    # Register
-    sb.table("event_clicks").insert({
-        "event_id": event_id,
-        "device_id": reg.device_id,
-        "platform": reg.platform,
-    }).execute()
-
-    return {"status": "registered"}
+    """Disabled — button removed in iOS 1.2.2 / Android 1.2.3"""
+    raise HTTPException(status_code=410, detail="Quick registration is no longer available. Please update the app.")
 
 
 @public_router.get("/events/{event_id}/check-registration")
