@@ -72,7 +72,7 @@ async def _warmup_cache():
 # === App Version Check ===
 
 _LATEST_VERSIONS = {
-    "ios": "1.2.2",
+    "ios": "2.0.0",
     "android": "2.0.0"
 }
 
