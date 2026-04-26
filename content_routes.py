@@ -774,6 +774,55 @@ def _strip_attribution_footer(body: str) -> str:
     return _ATTRIBUTION_FOOTER_RE.sub("", body).rstrip()
 
 
+# Known wine grapes + regions used to extract a focused Unsplash search query.
+# Order matters for multi-word matches (longer first) — the regex is case-insensitive.
+_WINE_KEYWORDS_RE = __import__("re").compile(
+    r"\b("
+    # Multi-word regions first
+    r"Ribera del Duero|R[íi]as Baixas|"
+    # Single-word grapes
+    r"Tempranillo|Verdejo|Albari[ñn]o|Garnacha|Monastrell|"
+    r"Mac[íi]a|Menc[íi]a|Macabeo|Xarel-lo|Parellada|Bobal|Graciano|Mazuelo|"
+    r"Viura|Air[ée]n|Cabernet|Merlot|Syrah|Chardonnay|Sauvignon|Moscatel|"
+    r"Godello|"
+    # Single-word regions
+    r"Rioja|Rueda|Priorat|Jerez|Navarra|Bierzo|Penedes|Penedès|"
+    r"Galicia|Catalu[ñn]a|Catalunya|"
+    # Wine types
+    r"Cava|Sherry|Tinto|Blanco|Rosado|Espumoso"
+    r")\b",
+    __import__("re").IGNORECASE,
+)
+
+
+def _smart_query_from_title(title: str) -> str:
+    """
+    Extract 1-2 wine-relevant keywords from a (Russian or English) title to use
+    as an Unsplash search query. Falls back to 'spanish wine' if nothing matches.
+    Examples:
+        'Годельо: открытие белого вина из Галисии…' → 'Godello wine'
+        'Tempranillo and Garnacha — kings of Rioja' → 'Tempranillo Rioja wine'
+        'Гид по испанским винам' → 'spanish wine'
+    """
+    if not title:
+        return "spanish wine"
+    matches = _WINE_KEYWORDS_RE.findall(title)
+    if matches:
+        # Dedup case-insensitively, keep first 2
+        seen = set()
+        unique = []
+        for m in matches:
+            key = m.lower()
+            if key not in seen:
+                seen.add(key)
+                unique.append(m)
+            if len(unique) >= 2:
+                break
+        return " ".join(unique) + " wine"
+    # No known wine term — Unsplash doesn't search Cyrillic well, so use a safe default
+    return "spanish wine"
+
+
 @admin_router.post("/articles/{article_id}/refresh-image")
 @supabase_query
 async def refresh_article_image(
@@ -793,18 +842,31 @@ async def refresh_article_image(
         raise HTTPException(status_code=404, detail="Article not found")
     article = result.data[0]
 
-    # Pick search query: caller override > English translation title > original title
+    # Pick search query: caller override > smart-extracted keyword.
+    # We never pass the full title to Unsplash — long natural-language strings return
+    # zero results. Smart extraction pulls out wine grapes / regions (e.g. "Godello",
+    # "Rioja Tempranillo") from EN title + RU title + first part of body, and falls
+    # back to "spanish wine".
     query = (body.query or "").strip()
     if not query:
         translations = article.get("translations") or {}
-        en_title = (translations.get("en") or {}).get("title")
-        query = en_title or article.get("title") or "spanish wine"
+        en_title = (translations.get("en") or {}).get("title", "")
+        ru_title = article.get("title", "")
+        body_head = (article.get("body") or "")[:600]
+        # Concatenate all sources — extraction picks first 2 unique wine keywords
+        haystack = " ".join([en_title, ru_title, body_head]).strip()
+        query = _smart_query_from_title(haystack)
 
     unsplash = _fetch_unsplash_image(query)
     if not unsplash:
+        # Structured detail so the admin UI can pre-fill the manual-override input
+        # with the keyword that just failed.
         raise HTTPException(
             status_code=502,
-            detail=f"Unsplash returned no results for '{query}'. Try a different keyword.",
+            detail={
+                "message": f"Unsplash returned no results for '{query}'. Try a different keyword.",
+                "query": query,
+            },
         )
 
     # Update body in original language (replace any existing footer).
