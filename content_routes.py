@@ -137,6 +137,11 @@ class UserRoleUpdate(BaseModel):
     role: str  # "admin" or "editor"
 
 
+class RefreshImageRequest(BaseModel):
+    """Optional override for the Unsplash search query when refreshing an article's image."""
+    query: Optional[str] = None
+
+
 # === Auth Endpoints ===
 
 @admin_router.post("/login")
@@ -733,6 +738,99 @@ def _fetch_unsplash_image(query: str) -> Optional[dict]:
     except Exception as e:
         logger.exception(f"Unsplash search exception for '{query}': {e}")
         return None
+
+
+# Localized prefix for the photo-attribution footer line.
+_ATTRIBUTION_PREFIX = {
+    "ru": "Фото",
+    "uk": "Фото",
+    "be": "Фота",
+    "en": "Photo",
+    "es": "Foto",
+}
+
+# Matches our attribution footer added at the end of body in any language we support.
+# Format: `\n\n---\n\n*Фото: [Name](url) / [Unsplash](url)*` (with localized prefix).
+_ATTRIBUTION_FOOTER_RE = __import__("re").compile(
+    r"\s*\n\n---\n\n\*(?:Фото|Фота|Photo|Foto):.*?\*\s*$",
+    __import__("re").DOTALL,
+)
+
+
+def _attribution_footer(unsplash: dict, lang: str) -> str:
+    """Build the markdown footer line crediting the photographer + Unsplash."""
+    prefix = _ATTRIBUTION_PREFIX.get(lang, "Photo")
+    return (
+        f"\n\n---\n\n*{prefix}: "
+        f"[{unsplash['photographer_name']}]({unsplash['photographer_url']}) "
+        f"/ [Unsplash]({unsplash['unsplash_url']})*"
+    )
+
+
+def _strip_attribution_footer(body: str) -> str:
+    """Remove our attribution footer if it's at the end of body. Idempotent."""
+    if not body:
+        return body
+    return _ATTRIBUTION_FOOTER_RE.sub("", body).rstrip()
+
+
+@admin_router.post("/articles/{article_id}/refresh-image")
+@supabase_query
+async def refresh_article_image(
+    article_id: str,
+    body: RefreshImageRequest,
+    user: AdminUser = Depends(require_admin),
+):
+    """
+    Re-query Unsplash for a fresh image and update the article (image_url + body
+    attribution + each translation's body attribution). Optionally pass `query`
+    to override the search keyword; otherwise inferred from the article's English
+    title (or original-language title if no English translation).
+    """
+    sb = get_supabase()
+    result = sb.table("articles").select("*").eq("id", article_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Article not found")
+    article = result.data[0]
+
+    # Pick search query: caller override > English translation title > original title
+    query = (body.query or "").strip()
+    if not query:
+        translations = article.get("translations") or {}
+        en_title = (translations.get("en") or {}).get("title")
+        query = en_title or article.get("title") or "spanish wine"
+
+    unsplash = _fetch_unsplash_image(query)
+    if not unsplash:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Unsplash returned no results for '{query}'. Try a different keyword.",
+        )
+
+    # Update body in original language (replace any existing footer).
+    orig_lang = article.get("language") or "ru"
+    new_body = _strip_attribution_footer(article.get("body") or "") + _attribution_footer(unsplash, orig_lang)
+
+    # Update each translation's body too so attribution matches the new image.
+    new_translations = dict(article.get("translations") or {})
+    for lang, trans in new_translations.items():
+        if isinstance(trans, dict) and trans.get("body"):
+            trans = dict(trans)
+            trans["body"] = _strip_attribution_footer(trans["body"]) + _attribution_footer(unsplash, lang)
+            new_translations[lang] = trans
+
+    sb.table("articles").update({
+        "image_url": unsplash["url"],
+        "body": new_body,
+        "translations": new_translations,
+    }).eq("id", article_id).execute()
+
+    return {
+        "status": "ok",
+        "image_url": unsplash["url"],
+        "photographer_name": unsplash["photographer_name"],
+        "query_used": query,
+    }
 
 
 async def _generate_article_task(api_key: str):
