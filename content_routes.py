@@ -3,6 +3,8 @@ Content API routes: articles, events, experts
 Handles both admin (CRUD) and public (read) endpoints
 """
 
+import os
+import requests
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Query as QueryParam
 from pydantic import BaseModel
 from typing import Optional
@@ -668,6 +670,71 @@ async def generate_article(
     return {"status": "generation_started", "message": "Article is being generated in background"}
 
 
+def _fetch_unsplash_image(query: str) -> Optional[dict]:
+    """
+    Search Unsplash for a relevant landscape photo. Returns dict with the image
+    URL, attribution metadata and triggers the download endpoint per Unsplash
+    API guidelines, or None on failure (caller should fall back to a pool).
+
+    Required env: UNSPLASH_ACCESS_KEY (Demo tier: 50 req/hour is plenty for our
+    weekly article generation).
+    """
+    access_key = os.environ.get("UNSPLASH_ACCESS_KEY")
+    if not access_key:
+        logger.warning("UNSPLASH_ACCESS_KEY not configured — using fallback pool")
+        return None
+
+    headers = {"Authorization": f"Client-ID {access_key}"}
+    try:
+        # 1. Search for a landscape photo matching the query
+        resp = requests.get(
+            "https://api.unsplash.com/search/photos",
+            params={
+                "query": query,
+                "orientation": "landscape",
+                "per_page": 10,
+                "content_filter": "high",
+            },
+            headers=headers,
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logger.warning(f"Unsplash search HTTP {resp.status_code} for '{query}': {resp.text[:200]}")
+            return None
+        results = resp.json().get("results") or []
+        if not results:
+            logger.warning(f"Unsplash returned no results for '{query}'")
+            return None
+
+        # Prefer the first (highest-relevance) hit
+        photo = results[0]
+        download_endpoint = photo.get("links", {}).get("download_location")
+
+        # 2. Trigger the download endpoint per Unsplash guidelines (analytics for photographers).
+        #    Best-effort — errors here don't block article creation.
+        if download_endpoint:
+            try:
+                requests.get(download_endpoint, headers=headers, timeout=5)
+            except Exception as e:
+                logger.warning(f"Unsplash download trigger failed: {e}")
+
+        # 3. Build the image URL with our preferred size; Unsplash CDN handles resizing.
+        raw_url = photo["urls"]["raw"]
+        image_url = f"{raw_url}&w=1200&q=80&fit=crop"
+
+        # 4. Build attribution metadata (with required UTM params per guidelines).
+        utm = "?utm_source=pomogaika&utm_medium=referral"
+        return {
+            "url": image_url,
+            "photographer_name": photo["user"]["name"],
+            "photographer_url": photo["user"]["links"]["html"] + utm,
+            "unsplash_url": "https://unsplash.com/" + utm,
+        }
+    except Exception as e:
+        logger.exception(f"Unsplash search exception for '{query}': {e}")
+        return None
+
+
 async def _generate_article_task(api_key: str):
     """Background task: generate article with Claude, save to DB, auto-translate."""
     import anthropic
@@ -755,29 +822,41 @@ BODY:
             logger.error(f"Generate article: failed to parse response. Title='{title}', body length={len(body)}")
             return
 
-        # Unsplash wine image pool — pick a random one, prefer unused
-        import random
-        WINE_PHOTO_POOL = [
-            "photo-1510812431401-41d2bd2722f3",  # wine glass close-up
-            "photo-1506377247377-2a5b3b417ebb",   # wine pouring
-            "photo-1474722883778-792e7990302f",   # wine bottles on shelf
-            "photo-1553361371-9b22f78e8b1d",   # wine cellar barrels
-            "photo-1516594915697-87eb3b1c14ea",   # red wine glass on table
-            "photo-1567529692333-de9fd6772897",   # vineyard landscape
-            "photo-1504279577054-acfeccf8fc52",   # wine tasting setup
-            "photo-1558642452-9d2a7deb7f62",   # wine and cheese pairing
-            "photo-1528823872057-9c018a7a7553",   # wine cork and bottle
-            "photo-1543418219-0e518d919e55",   # wine glasses cheers
-            "photo-1586370434639-0fe43b2d32e6",   # grapes on vine
-            "photo-1423483641154-5411ec9c0ddf",   # red wine close-up
-        ]
-        # Check which images are already used by existing articles
-        used_urls = set(a.get("image_url", "") for a in (existing.data or []))
-        available_photos = [p for p in WINE_PHOTO_POOL if f"https://images.unsplash.com/{p}?w=800&q=80" not in used_urls]
-        if not available_photos:
-            available_photos = WINE_PHOTO_POOL  # All used — reset pool
-        chosen_photo = random.choice(available_photos)
-        image_url = f"https://images.unsplash.com/{chosen_photo}?w=800&q=80"
+        # Pick a relevant image from Unsplash search (with fallback pool)
+        unsplash_result = _fetch_unsplash_image(image_keyword or "spanish wine")
+        if unsplash_result:
+            image_url = unsplash_result["url"]
+            # Append attribution as markdown footer (renders the same in all 5 languages
+            # because it's added BEFORE translation step). Per Unsplash guidelines.
+            attribution_line = (
+                f"\n\n---\n\n*Фото: "
+                f"[{unsplash_result['photographer_name']}]({unsplash_result['photographer_url']}) "
+                f"/ [Unsplash]({unsplash_result['unsplash_url']})*"
+            )
+            body = body + attribution_line
+        else:
+            # Fallback: random pick from curated pool, prefer unused
+            import random
+            WINE_PHOTO_POOL = [
+                "photo-1510812431401-41d2bd2722f3",  # wine glass close-up
+                "photo-1506377247377-2a5b3b417ebb",   # wine pouring
+                "photo-1474722883778-792e7990302f",   # wine bottles on shelf
+                "photo-1553361371-9b22f78e8b1d",   # wine cellar barrels
+                "photo-1516594915697-87eb3b1c14ea",   # red wine glass on table
+                "photo-1567529692333-de9fd6772897",   # vineyard landscape
+                "photo-1504279577054-acfeccf8fc52",   # wine tasting setup
+                "photo-1558642452-9d2a7deb7f62",   # wine and cheese pairing
+                "photo-1528823872057-9c018a7a7553",   # wine cork and bottle
+                "photo-1586370434639-0fe43b2d32e6",   # grapes on vine
+                "photo-1423483641154-5411ec9c0ddf",   # red wine close-up
+            ]
+            used_urls = set(a.get("image_url", "") for a in (existing.data or []))
+            available_photos = [p for p in WINE_PHOTO_POOL if f"https://images.unsplash.com/{p}?w=800&q=80" not in used_urls]
+            if not available_photos:
+                available_photos = WINE_PHOTO_POOL
+            chosen_photo = random.choice(available_photos)
+            image_url = f"https://images.unsplash.com/{chosen_photo}?w=800&q=80"
+            logger.warning(f"Unsplash search failed for '{image_keyword}', fell back to pool")
 
         # Save article (as draft)
         insert_data = {
