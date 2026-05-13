@@ -83,3 +83,35 @@ CREATE TRIGGER articles_updated_at
 CREATE TRIGGER events_updated_at
     BEFORE UPDATE ON events
     FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+-- =====================================================================
+-- Data API grants for service_role
+-- =====================================================================
+-- Required as of Supabase platform change:
+--   * New projects (from May 30 2026): no default grants on new tables
+--   * Existing projects (from Oct 30 2026): same — new tables only
+-- Existing tables on prod Supabase keep their original grants; the
+-- statements below are idempotent (safe to re-run) and serve as the
+-- canonical template for any future table added to public.
+--
+-- We grant only service_role: backend FastAPI talks to Supabase via
+-- the REST API with the service-role key. iOS/Android clients NEVER
+-- access Supabase directly, so anon/authenticated grants are
+-- intentionally omitted (attack-surface reduction).
+--
+-- Any new CREATE TABLE public.<name> added below or in follow-up
+-- migrations MUST include a matching GRANT statement here.
+-- =====================================================================
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.admin_users   TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.experts       TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.articles      TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.events        TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.event_clicks  TO service_role;
+
+-- NOTE: 4 tables added to prod Supabase later via direct SQL Editor and
+-- NOT present as CREATE TABLE blocks above (content_reactions,
+-- article_views, event_views, device_tokens). They keep their default
+-- grants on the live project until Oct 30 2026. If this schema file
+-- is ever used to re-provision from scratch, those tables and their
+-- grants will need to be added here first.
