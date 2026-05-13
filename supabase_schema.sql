@@ -60,12 +60,72 @@ CREATE TABLE event_clicks (
     clicked_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- 6. Content reactions (like/dislike on articles & events — added 2026-03)
+-- Schema reconstructed from live Supabase via PostgREST OpenAPI spec on
+-- 2026-05-09. UNIQUE (content_type, content_id, device_id) is INFERRED
+-- from memory note in v2-features.md ("UNIQUE upsert"); the backend's
+-- toggle logic relies on it. content_id is polymorphic (articles or
+-- events), so no FK is declared.
+CREATE TABLE content_reactions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    content_type TEXT NOT NULL,   -- 'article' or 'event'
+    content_id UUID NOT NULL,
+    device_id TEXT NOT NULL,
+    reaction TEXT NOT NULL,        -- 'like' or 'dislike'
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (content_type, content_id, device_id)
+);
+
+-- 7. Article views (view tracking — added 2026-03)
+-- Schema reconstructed from live Supabase OpenAPI spec on 2026-05-09.
+-- FK to articles(id) confirmed via OpenAPI fk metadata; ON DELETE
+-- behaviour is INFERRED (CASCADE, matching event_clicks pattern).
+CREATE TABLE article_views (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    article_id UUID NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+    device_id TEXT,
+    platform TEXT,  -- 'ios' or 'android'
+    viewed_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 8. Event views (view tracking — added 2026-03)
+CREATE TABLE event_views (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_id UUID NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+    device_id TEXT,
+    platform TEXT,
+    viewed_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 9. Device tokens (FCM push notification registry — added 2026-03)
+-- Schema reconstructed from live Supabase OpenAPI spec on 2026-05-09.
+-- UNIQUE (device_id) is INFERRED — the /device-token endpoint upserts
+-- one row per device. updated_at auto-trigger below mirrors articles/events.
+CREATE TABLE device_tokens (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    device_id TEXT NOT NULL UNIQUE,
+    fcm_token TEXT NOT NULL,
+    platform TEXT NOT NULL,        -- 'ios' or 'android'
+    language TEXT DEFAULT 'ru',    -- last known UI language (for localized pushes)
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- Indexes for performance
 CREATE INDEX idx_articles_expert ON articles(expert_id);
 CREATE INDEX idx_articles_published ON articles(is_published, created_at DESC);
 CREATE INDEX idx_events_active ON events(is_active, event_date);
 CREATE INDEX idx_event_clicks_event ON event_clicks(event_id);
 CREATE INDEX idx_event_clicks_device ON event_clicks(device_id);
+
+-- Indexes for tables 6-9 (per v2-features.md memory note for views;
+-- best-practice defaults for reactions and tokens)
+CREATE INDEX idx_content_reactions_lookup ON content_reactions(content_type, content_id);
+CREATE INDEX idx_article_views_article ON article_views(article_id);
+CREATE INDEX idx_article_views_device ON article_views(device_id, article_id);
+CREATE INDEX idx_event_views_event ON event_views(event_id);
+CREATE INDEX idx_event_views_device ON event_views(device_id, event_id);
+CREATE INDEX idx_device_tokens_platform ON device_tokens(platform);
 
 -- Auto-update updated_at on articles
 CREATE OR REPLACE FUNCTION update_updated_at()
@@ -82,6 +142,12 @@ CREATE TRIGGER articles_updated_at
 
 CREATE TRIGGER events_updated_at
     BEFORE UPDATE ON events
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+-- Mirror trigger for device_tokens (INFERRED — matches articles/events
+-- pattern, since the table has an updated_at column with default now()).
+CREATE TRIGGER device_tokens_updated_at
+    BEFORE UPDATE ON device_tokens
     FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 
 -- =====================================================================
@@ -103,15 +169,12 @@ CREATE TRIGGER events_updated_at
 -- migrations MUST include a matching GRANT statement here.
 -- =====================================================================
 
-GRANT SELECT, INSERT, UPDATE, DELETE ON public.admin_users   TO service_role;
-GRANT SELECT, INSERT, UPDATE, DELETE ON public.experts       TO service_role;
-GRANT SELECT, INSERT, UPDATE, DELETE ON public.articles      TO service_role;
-GRANT SELECT, INSERT, UPDATE, DELETE ON public.events        TO service_role;
-GRANT SELECT, INSERT, UPDATE, DELETE ON public.event_clicks  TO service_role;
-
--- NOTE: 4 tables added to prod Supabase later via direct SQL Editor and
--- NOT present as CREATE TABLE blocks above (content_reactions,
--- article_views, event_views, device_tokens). They keep their default
--- grants on the live project until Oct 30 2026. If this schema file
--- is ever used to re-provision from scratch, those tables and their
--- grants will need to be added here first.
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.admin_users        TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.experts            TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.articles           TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.events             TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.event_clicks       TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.content_reactions  TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.article_views      TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.event_views        TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.device_tokens      TO service_role;
