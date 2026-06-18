@@ -138,7 +138,7 @@ class UserRoleUpdate(BaseModel):
 
 
 class RefreshImageRequest(BaseModel):
-    """Optional override for the Unsplash search query when refreshing an article's image."""
+    """Optional override for the Pexels search query when refreshing an article's image."""
     query: Optional[str] = None
 
 
@@ -675,68 +675,61 @@ async def generate_article(
     return {"status": "generation_started", "message": "Article is being generated in background"}
 
 
-def _fetch_unsplash_image(query: str) -> Optional[dict]:
+def _fetch_stock_image(query: str) -> Optional[dict]:
     """
-    Search Unsplash for a relevant landscape photo. Returns dict with the image
-    URL, attribution metadata and triggers the download endpoint per Unsplash
-    API guidelines, or None on failure (caller should fall back to a pool).
+    Search Pexels for a relevant landscape photo. Returns dict with the image
+    URL + attribution metadata, or None on failure (caller falls back to pool).
 
-    Required env: UNSPLASH_ACCESS_KEY (Demo tier: 50 req/hour is plenty for our
-    weekly article generation).
+    Required env: PEXELS_API_KEY (free tier: 200 req/hour, 20k/month — plenty
+    for our weekly article generation).
     """
-    access_key = os.environ.get("UNSPLASH_ACCESS_KEY")
+    access_key = os.environ.get("PEXELS_API_KEY")
     if not access_key:
-        logger.warning("UNSPLASH_ACCESS_KEY not configured — using fallback pool")
+        logger.warning("PEXELS_API_KEY not configured — using fallback pool")
         return None
 
-    headers = {"Authorization": f"Client-ID {access_key}"}
+    headers = {"Authorization": access_key}
     try:
         # 1. Search for a landscape photo matching the query
         resp = requests.get(
-            "https://api.unsplash.com/search/photos",
+            "https://api.pexels.com/v1/search",
             params={
                 "query": query,
                 "orientation": "landscape",
                 "per_page": 10,
-                "content_filter": "high",
             },
             headers=headers,
             timeout=10,
         )
         if resp.status_code != 200:
-            logger.warning(f"Unsplash search HTTP {resp.status_code} for '{query}': {resp.text[:200]}")
+            logger.warning(f"Pexels search HTTP {resp.status_code} for '{query}': {resp.text[:200]}")
             return None
-        results = resp.json().get("results") or []
-        if not results:
-            logger.warning(f"Unsplash returned no results for '{query}'")
+        photos = resp.json().get("photos") or []
+        if not photos:
+            logger.warning(f"Pexels returned no results for '{query}'")
             return None
 
-        # Prefer the first (highest-relevance) hit
-        photo = results[0]
-        download_endpoint = photo.get("links", {}).get("download_location")
+        # 2. Prefer the first (highest-relevance) hit. Pexels pre-renders sized
+        #    variants; large2x (~1880px wide) is our hero image, landscape is a
+        #    pre-cropped fallback.
+        photo = photos[0]
+        src = photo.get("src") or {}
+        image_url = src.get("large2x") or src.get("landscape") or src.get("large")
+        if not image_url:
+            logger.warning(f"Pexels result for '{query}' had no usable src URL")
+            return None
 
-        # 2. Trigger the download endpoint per Unsplash guidelines (analytics for photographers).
-        #    Best-effort — errors here don't block article creation.
-        if download_endpoint:
-            try:
-                requests.get(download_endpoint, headers=headers, timeout=5)
-            except Exception as e:
-                logger.warning(f"Unsplash download trigger failed: {e}")
-
-        # 3. Build the image URL with our preferred size; Unsplash CDN handles resizing.
-        raw_url = photo["urls"]["raw"]
-        image_url = f"{raw_url}&w=1200&q=80&fit=crop"
-
-        # 4. Build attribution metadata (with required UTM params per guidelines).
-        utm = "?utm_source=pomogaika&utm_medium=referral"
+        # 3. Build attribution metadata. Pexels asks for a credit to the
+        #    photographer and a link back to Pexels.
         return {
             "url": image_url,
-            "photographer_name": photo["user"]["name"],
-            "photographer_url": photo["user"]["links"]["html"] + utm,
-            "unsplash_url": "https://unsplash.com/" + utm,
+            "photographer_name": photo.get("photographer") or "Pexels",
+            "photographer_url": photo.get("photographer_url") or "https://www.pexels.com",
+            "source_name": "Pexels",
+            "source_url": photo.get("url") or "https://www.pexels.com",
         }
     except Exception as e:
-        logger.exception(f"Unsplash search exception for '{query}': {e}")
+        logger.exception(f"Pexels search exception for '{query}': {e}")
         return None
 
 
@@ -750,20 +743,21 @@ _ATTRIBUTION_PREFIX = {
 }
 
 # Matches our attribution footer added at the end of body in any language we support.
-# Format: `\n\n---\n\n*Фото: [Name](url) / [Unsplash](url)*` (with localized prefix).
+# Format: `\n\n---\n\n*Фото: [Name](url) / [Pexels](url)*` (with localized prefix).
+# The regex keys off the localized prefix, so it matches regardless of source name.
 _ATTRIBUTION_FOOTER_RE = __import__("re").compile(
     r"\s*\n\n---\n\n\*(?:Фото|Фота|Photo|Foto):.*?\*\s*$",
     __import__("re").DOTALL,
 )
 
 
-def _attribution_footer(unsplash: dict, lang: str) -> str:
-    """Build the markdown footer line crediting the photographer + Unsplash."""
+def _attribution_footer(image: dict, lang: str) -> str:
+    """Build the markdown footer line crediting the photographer + source."""
     prefix = _ATTRIBUTION_PREFIX.get(lang, "Photo")
     return (
         f"\n\n---\n\n*{prefix}: "
-        f"[{unsplash['photographer_name']}]({unsplash['photographer_url']}) "
-        f"/ [Unsplash]({unsplash['unsplash_url']})*"
+        f"[{image['photographer_name']}]({image['photographer_url']}) "
+        f"/ [{image['source_name']}]({image['source_url']})*"
     )
 
 
@@ -774,7 +768,7 @@ def _strip_attribution_footer(body: str) -> str:
     return _ATTRIBUTION_FOOTER_RE.sub("", body).rstrip()
 
 
-# Known wine grapes + regions used to extract a focused Unsplash search query.
+# Known wine grapes + regions used to extract a focused Pexels search query.
 # Order matters for multi-word matches (longer first) — the regex is case-insensitive.
 _WINE_KEYWORDS_RE = __import__("re").compile(
     r"\b("
@@ -798,7 +792,7 @@ _WINE_KEYWORDS_RE = __import__("re").compile(
 def _smart_query_from_title(title: str) -> str:
     """
     Extract 1-2 wine-relevant keywords from a (Russian or English) title to use
-    as an Unsplash search query. Falls back to 'spanish wine' if nothing matches.
+    as a Pexels search query. Falls back to 'spanish wine' if nothing matches.
     Examples:
         'Годельо: открытие белого вина из Галисии…' → 'Godello wine'
         'Tempranillo and Garnacha — kings of Rioja' → 'Tempranillo Rioja wine'
@@ -819,7 +813,7 @@ def _smart_query_from_title(title: str) -> str:
             if len(unique) >= 2:
                 break
         return " ".join(unique) + " wine"
-    # No known wine term — Unsplash doesn't search Cyrillic well, so use a safe default
+    # No known wine term — stock search doesn't handle Cyrillic well, so use a safe default
     return "spanish wine"
 
 
@@ -831,7 +825,7 @@ async def refresh_article_image(
     user: AdminUser = Depends(require_admin),
 ):
     """
-    Re-query Unsplash for a fresh image and update the article (image_url + body
+    Re-query Pexels for a fresh image and update the article (image_url + body
     attribution + each translation's body attribution). Optionally pass `query`
     to override the search keyword; otherwise inferred from the article's English
     title (or original-language title if no English translation).
@@ -843,7 +837,7 @@ async def refresh_article_image(
     article = result.data[0]
 
     # Pick search query: caller override > smart-extracted keyword.
-    # We never pass the full title to Unsplash — long natural-language strings return
+    # We never pass the full title to Pexels — long natural-language strings return
     # zero results. Smart extraction pulls out wine grapes / regions (e.g. "Godello",
     # "Rioja Tempranillo") from EN title + RU title + first part of body, and falls
     # back to "spanish wine".
@@ -857,40 +851,40 @@ async def refresh_article_image(
         haystack = " ".join([en_title, ru_title, body_head]).strip()
         query = _smart_query_from_title(haystack)
 
-    unsplash = _fetch_unsplash_image(query)
-    if not unsplash:
+    image = _fetch_stock_image(query)
+    if not image:
         # Structured detail so the admin UI can pre-fill the manual-override input
         # with the keyword that just failed.
         raise HTTPException(
             status_code=502,
             detail={
-                "message": f"Unsplash returned no results for '{query}'. Try a different keyword.",
+                "message": f"Pexels returned no results for '{query}'. Try a different keyword.",
                 "query": query,
             },
         )
 
     # Update body in original language (replace any existing footer).
     orig_lang = article.get("language") or "ru"
-    new_body = _strip_attribution_footer(article.get("body") or "") + _attribution_footer(unsplash, orig_lang)
+    new_body = _strip_attribution_footer(article.get("body") or "") + _attribution_footer(image, orig_lang)
 
     # Update each translation's body too so attribution matches the new image.
     new_translations = dict(article.get("translations") or {})
     for lang, trans in new_translations.items():
         if isinstance(trans, dict) and trans.get("body"):
             trans = dict(trans)
-            trans["body"] = _strip_attribution_footer(trans["body"]) + _attribution_footer(unsplash, lang)
+            trans["body"] = _strip_attribution_footer(trans["body"]) + _attribution_footer(image, lang)
             new_translations[lang] = trans
 
     sb.table("articles").update({
-        "image_url": unsplash["url"],
+        "image_url": image["url"],
         "body": new_body,
         "translations": new_translations,
     }).eq("id", article_id).execute()
 
     return {
         "status": "ok",
-        "image_url": unsplash["url"],
-        "photographer_name": unsplash["photographer_name"],
+        "image_url": image["url"],
+        "photographer_name": image["photographer_name"],
         "query_used": query,
     }
 
@@ -943,7 +937,7 @@ async def _generate_article_task(api_key: str):
 
 Ответь СТРОГО в формате:
 TITLE: Заголовок статьи
-IMAGE: ключевое слово для поиска фото на unsplash (на английском, 1-2 слова про вино)
+IMAGE: ключевое слово для поиска фото (на английском, 1-2 слова про вино)
 BODY:
 Текст статьи..."""
             }]
@@ -988,18 +982,13 @@ BODY:
             logger.error(f"Generate article: failed to parse response. Title='{title}', body length={len(body)}")
             return
 
-        # Pick a relevant image from Unsplash search (with fallback pool)
-        unsplash_result = _fetch_unsplash_image(image_keyword or "spanish wine")
-        if unsplash_result:
-            image_url = unsplash_result["url"]
-            # Append attribution as markdown footer (renders the same in all 5 languages
-            # because it's added BEFORE translation step). Per Unsplash guidelines.
-            attribution_line = (
-                f"\n\n---\n\n*Фото: "
-                f"[{unsplash_result['photographer_name']}]({unsplash_result['photographer_url']}) "
-                f"/ [Unsplash]({unsplash_result['unsplash_url']})*"
-            )
-            body = body + attribution_line
+        # Pick a relevant image from Pexels search (with fallback pool)
+        image_result = _fetch_stock_image(image_keyword or "spanish wine")
+        if image_result:
+            image_url = image_result["url"]
+            # Append attribution as markdown footer in the original language (ru).
+            # Added BEFORE the translation step; the translator preserves it.
+            body = body + _attribution_footer(image_result, "ru")
         else:
             # Fallback: random pick from curated pool, prefer unused
             import random
@@ -1022,7 +1011,7 @@ BODY:
                 available_photos = WINE_PHOTO_POOL
             chosen_photo = random.choice(available_photos)
             image_url = f"https://images.unsplash.com/{chosen_photo}?w=800&q=80"
-            logger.warning(f"Unsplash search failed for '{image_keyword}', fell back to pool")
+            logger.warning(f"Pexels search failed for '{image_keyword}', fell back to pool")
 
         # Save article (as draft)
         insert_data = {
