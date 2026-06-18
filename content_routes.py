@@ -917,8 +917,14 @@ async def _generate_article_task(api_key: str):
 
         # Generate with Claude
         client = anthropic.Anthropic(api_key=api_key)
+        # Model is configurable via ANTHROPIC_MODEL env var so a future model
+        # retirement can be fixed in the Render dashboard without a code change.
+        # Default is a current model; the previously hardcoded
+        # claude-sonnet-4-20250514 (Sonnet 4.0, May 2025) was retired ~June 2026
+        # and silently broke generation (the except below only logs to Render).
+        model = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
         message = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model=model,
             max_tokens=2000,
             messages=[{
                 "role": "user",
