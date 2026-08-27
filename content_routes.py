@@ -15,7 +15,7 @@ import logging
 
 from supabase_client import get_supabase, supabase_query
 from auth import AdminUser, get_current_user, require_admin
-from translation import translate_article, translate_event, check_quota
+from translation import translate_article, translate_event, translate_expert, check_quota
 from push_notifications import notify_new_article, notify_new_event, send_push_async
 
 logger = logging.getLogger(__name__)
@@ -124,6 +124,10 @@ class ExpertCreate(BaseModel):
     bio: Optional[str] = None
     avatar_url: Optional[str] = None
     user_id: Optional[str] = None
+    # {"en": {"name": "Nikolay", "bio": "..."}, "es": {...}} — same shape as articles/events.
+    # Names are curated by hand (transliterated for en/es, Cyrillic kept for uk/be);
+    # only bios are machine-translated. See translation.translate_expert.
+    translations: Optional[dict] = None
 
 
 class UserCreate(BaseModel):
@@ -251,6 +255,45 @@ async def update_expert(
     if not result.data:
         raise HTTPException(status_code=404, detail="Expert not found")
     return result.data[0]
+
+
+@admin_router.post("/experts/{expert_id}/translate")
+@supabase_query
+async def translate_expert_endpoint(
+    expert_id: str,
+    user: AdminUser = Depends(require_admin)
+):
+    """
+    Auto-translate an expert's BIO into the other app languages (MyMemory).
+
+    Names are NOT touched — they're real people, and machine translation mangles proper
+    nouns. Curate names by hand via PUT /admin/experts/{id} with a `translations` payload
+    (we transliterate for en/es and keep Cyrillic for uk/be). Any existing name
+    translation is preserved here.
+    """
+    sb = get_supabase()
+    result = sb.table("experts").select("*").eq("id", expert_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Expert not found")
+    expert = result.data[0]
+
+    if not expert.get("bio"):
+        raise HTTPException(status_code=400, detail="Expert has no bio to translate")
+
+    if not await check_quota():
+        raise HTTPException(status_code=429, detail="Translation quota exceeded, try later")
+
+    fresh = await translate_expert(expert["bio"], "ru")
+
+    # Merge: keep hand-curated names, replace only the bio per language.
+    merged = dict(expert.get("translations") or {})
+    for lang, entry in fresh.items():
+        current = dict(merged.get(lang) or {})
+        current["bio"] = entry["bio"]
+        merged[lang] = current
+
+    sb.table("experts").update({"translations": merged}).eq("id", expert_id).execute()
+    return {"status": "ok", "translations": merged}
 
 
 # === Users Endpoints (admin only) ===
@@ -1456,7 +1499,7 @@ async def public_list_articles(lang: str = "ru", limit: int = 10):
     sb = get_supabase()
     result = sb.table("articles").select(
         "id, title, body, image_url, language, translations, created_at, refreshed_at, disabled_languages, "
-        "experts(id, name, avatar_url)"
+        "experts(id, name, avatar_url, translations)"
     ).eq(
         "is_published", True
     ).order("created_at", desc=True).limit(limit).execute()
@@ -1480,7 +1523,7 @@ async def public_get_article(article_id: str, lang: str = "ru"):
     sb = get_supabase()
     result = sb.table("articles").select(
         "id, title, body, image_url, language, translations, created_at, refreshed_at, disabled_languages, "
-        "experts(id, name, avatar_url)"
+        "experts(id, name, avatar_url, translations)"
     ).eq("id", article_id).eq("is_published", True).execute()
 
     if not result.data:
@@ -1655,11 +1698,16 @@ async def public_register_event(
 
 @public_router.get("/experts")
 @supabase_query
-async def public_list_experts():
-    """Get list of wine experts"""
+async def public_list_experts(lang: str = "ru"):
+    """
+    Get list of wine experts, localized to the requested language.
+
+    `lang` defaults to "ru" so older app versions (which don't send it) keep working
+    exactly as before — they get the original Russian record.
+    """
     sb = get_supabase()
-    result = sb.table("experts").select("id, name, bio, avatar_url").execute()
-    return result.data
+    result = sb.table("experts").select("id, name, bio, avatar_url, translations").execute()
+    return [_localize_expert(row, lang) for row in (result.data or [])]
 
 
 # === Quick Register (one-tap "I'm going") ===
@@ -1847,7 +1895,29 @@ def _localize_article(row: dict, lang: str) -> dict:
         "image_url": row.get("image_url"),
         "created_at": row["created_at"],
         "refreshed_at": row.get("refreshed_at"),
-        "expert": row.get("experts"),
+        # Byline is localized too — otherwise the article body would be in Spanish
+        # while the author line stayed in Russian.
+        "expert": _localize_expert(row["experts"], lang) if row.get("experts") else None,
+    }
+
+
+def _localize_expert(row: dict, lang: str) -> dict:
+    """
+    Return an expert with name/bio in the requested language.
+
+    Experts have no per-row `language` column (unlike articles/events) — the source is
+    always Russian, so anything missing falls back to the original fields. Name and bio
+    fall back independently: a curated name translation still applies even if the bio
+    hasn't been translated yet, and vice versa.
+    """
+    translations = row.get("translations") or {}
+    t = translations.get(lang) or {}
+
+    return {
+        "id": row["id"],
+        "name": t.get("name") or row.get("name"),
+        "bio": t.get("bio") or row.get("bio"),
+        "avatar_url": row.get("avatar_url"),
     }
 
 

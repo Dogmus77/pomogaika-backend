@@ -17,6 +17,12 @@ CREATE TABLE experts (
     name TEXT NOT NULL,
     bio TEXT,
     avatar_url TEXT,
+    -- Localized name/bio, same shape as articles/events:
+    -- {"en": {"name": "Nikolay", "bio": "..."}, "es": {...}}
+    -- Source language is always ru (no per-row `language` column here).
+    -- Names are curated by hand (transliterated en/es, Cyrillic kept for uk/be);
+    -- only bios are machine-translated via POST /admin/experts/{id}/translate.
+    translations JSONB DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 

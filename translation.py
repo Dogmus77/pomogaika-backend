@@ -234,6 +234,31 @@ async def translate_article(title: str, body: str, source_lang: str) -> dict:
     return translations
 
 
+async def translate_expert(bio: str | None, source_lang: str) -> dict:
+    """
+    Translate an expert's bio to all app languages.
+    Returns dict: {"en": {"bio": "..."}, ...}
+
+    NOTE: the expert's NAME is deliberately NOT machine-translated — these are real
+    people, and MyMemory mangles proper nouns. Names are curated by hand in the admin
+    (transliterated for en/es, left in Cyrillic for uk/be). This helper only fills in
+    the bio; any existing hand-written name stays untouched by the caller.
+    """
+    translations = {}
+    if not bio:
+        return translations
+
+    target_languages = [lang for lang in ALL_LANGUAGES if lang != source_lang]
+    for lang in target_languages:
+        translated_bio = await translate_long_text(bio, source_lang, lang)
+        await asyncio.sleep(API_DELAY_SEC)
+        if translated_bio:
+            translations[lang] = {"bio": translated_bio}
+            logger.info(f"Translated expert bio to {lang}: OK")
+
+    return translations
+
+
 async def translate_event(title: str, description: str | None, source_lang: str) -> dict:
     """
     Translate event title and description to all app languages.
