@@ -165,12 +165,25 @@ def fetch_wines_sync(postal_code: str = "46001") -> list[ParserWine]:
         "pat\u00E9", "conserva", "lata de", "atun", "at\u00FAn",
         "cafe", "caf\u00E9", "capsula", "c\u00E1psula", "nespresso",
         "pimienta", "pimiento", "especias",
+        # fruit: Masymas returned "Granadas" (pomegranates, 0.97 EUR) as a red wine,
+        # and the price sort put it first under "reds under 10 EUR". Plural only:
+        # D.O. Granada wines say "Granada".
+        "granadas",
     ]
     all_wines = [
         w for w in all_wines
         if not any(kw in w.name.lower() for kw in _EXCLUDE_KEYWORDS)
     ]
     
+    # 5. One entry per product id: the per-type queries overlap (the same bottle came
+    # back twice under "reds"), and the apps key their lists by id.
+    unique, seen = [], set()
+    for w in all_wines:
+        if w.id not in seen:
+            seen.add(w.id)
+            unique.append(w)
+    all_wines = unique
+
     elapsed = time.time() - start
     print(f"\u23F1\uFE0F fetch_wines_sync: {len(all_wines)} wines ({len(premium_wines)} premium) in {elapsed:.1f}s")
     return all_wines
