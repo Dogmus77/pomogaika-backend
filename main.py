@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from sommelier import SommelierEngine
 from wine_parser import WineAggregator, WineType, Wine as ParserWine
 from content_routes import admin_router, public_router
+from ai_routes import router as ai_router
 from auth import require_admin
 
 app = FastAPI(
@@ -32,6 +33,7 @@ app = FastAPI(
 # Content API routers (articles, events, experts, admin)
 app.include_router(admin_router)
 app.include_router(public_router)
+app.include_router(ai_router)          # /ask, /pairings (2.3.0)
 
 app.add_middleware(
     CORSMiddleware,

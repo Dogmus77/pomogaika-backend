@@ -16,11 +16,11 @@ import json
 import logging
 import re
 
-import anthropic
+from claude_client import HAIKU, structured_json
 
 logger = logging.getLogger(__name__)
 
-TRANSLATION_MODEL = "claude-haiku-5-5"
+TRANSLATION_MODEL = HAIKU
 
 # All supported app languages
 ALL_LANGUAGES = ["en", "es", "ru", "uk", "be"]
@@ -60,17 +60,6 @@ Translate the value of every field in the JSON you are given, and return the sam
 - Keep wine names, grape varieties, D.O. regions, store names and brands as written.
 - Keep people's names as written."""
 
-_client: anthropic.AsyncAnthropic | None = None
-
-
-def _get_client() -> anthropic.AsyncAnthropic:
-    # Created lazily so importing this module never needs ANTHROPIC_API_KEY.
-    global _client
-    if _client is None:
-        _client = anthropic.AsyncAnthropic()
-    return _client
-
-
 async def _translate_fields(fields: dict[str, str], source_lang: str, target_lang: str) -> dict[str, str] | None:
     """
     Translate a set of named text fields in one request.
@@ -99,46 +88,18 @@ async def _translate_fields(fields: dict[str, str], source_lang: str, target_lan
 
 
 async def _request(fields: dict[str, str], schema: dict, source_lang: str, target_lang: str, pair: str) -> dict[str, str] | None:
-    try:
-        message = await _get_client().messages.create(
-            model=TRANSLATION_MODEL,
-            # Thinking is on by default on Haiku 5.5 and counts toward this ceiling.
-            max_tokens=16000,
-            output_config={
-                # Translation doesn't need deep reasoning; low keeps it fast and cheap.
-                "effort": "low",
-                "format": {"type": "json_schema", "schema": schema},
-            },
-            system=SYSTEM_PROMPT,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"Translate from {LANG_NAMES.get(source_lang, source_lang)} into {LANG_NAMES.get(target_lang, target_lang)}.\n\n"
-                    + json.dumps(fields, ensure_ascii=False)
-                ),
-            }],
-        )
-    except anthropic.APIError as e:
-        # The SDK has already retried 429/5xx/connection errors by this point.
-        logger.error(f"Translation {pair} failed: {type(e).__name__}: {e}")
+    data = await structured_json(
+        system=SYSTEM_PROMPT,
+        user=(f"Translate from {LANG_NAMES.get(source_lang, source_lang)} into "
+              f"{LANG_NAMES.get(target_lang, target_lang)}.\n\n" + json.dumps(fields, ensure_ascii=False)),
+        schema=schema,
+        label=f"Translation {pair}",
+        model=TRANSLATION_MODEL,
+        effort="low",          # translation doesn't need deep reasoning
+        max_tokens=16000,      # a whole article body plus thinking
+    )
+    if data is None:
         return None
-
-    # Haiku 5.5 has no server-side refusal fallback, and a cut-off reply is not
-    # valid JSON - either way, skip this language rather than store a partial.
-    if message.stop_reason != "end_turn":
-        logger.error(f"Translation {pair}: stop_reason={message.stop_reason}")
-        return None
-
-    text = next((b.text for b in message.content if b.type == "text"), None)
-    try:
-        data = json.loads(text or "")
-    except json.JSONDecodeError:
-        logger.error(f"Translation {pair}: reply is not JSON: {(text or '')[:200]}")
-        return None
-    if not isinstance(data, dict):
-        logger.error(f"Translation {pair}: reply is not a JSON object")
-        return None
-
     result = {name: (data.get(name) or "").strip() for name in fields}
     if not all(result.values()):
         logger.warning(f"Translation {pair}: empty field(s) {[k for k, v in result.items() if not v]}")
