@@ -12,6 +12,8 @@ from datetime import datetime
 import uuid as uuid_mod
 import io
 import logging
+import asyncio
+from collections import Counter, defaultdict
 
 from supabase_client import get_supabase, new_auth_client, supabase_query
 from auth import AdminUser, get_current_user, require_admin
@@ -656,9 +658,7 @@ async def translate_article_sync_test(
             "count": len(translations) if translations else 0,
         }
         if translations:
-            sb.table("articles").update(
-                {"translations": translations}
-            ).eq("id", article_id).execute()
+            _save_translations("articles", article_id, translations)
             diagnostics["saved"] = True
     except Exception as e:
         diagnostics["full_translate"] = {"error": str(e)}
@@ -1326,144 +1326,119 @@ async def list_event_clicks(
     return result.data
 
 
+def _fetch_all(sb, table: str, columns: str, **eq) -> list[dict]:
+    """Every row of `table`, paging past PostgREST's default 1000-row limit
+    (without paging, totals silently stopped growing at 1000 rows)."""
+    rows: list[dict] = []
+    page = 1000
+    while True:
+        query = sb.table(table).select(columns)
+        for column, value in eq.items():
+            query = query.eq(column, value)
+        batch = query.range(len(rows), len(rows) + page - 1).execute().data or []
+        rows.extend(batch)
+        if len(batch) < page:
+            return rows
+
+
+def _reaction_counts(sb, content_type: str) -> tuple[Counter, Counter]:
+    reactions = _fetch_all(sb, "content_reactions", "content_id, reaction", content_type=content_type)
+    likes = Counter(r["content_id"] for r in reactions if r.get("reaction") == "like")
+    dislikes = Counter(r["content_id"] for r in reactions if r.get("reaction") == "dislike")
+    return likes, dislikes
+
+
+def _views_by(rows: list[dict], key: str) -> tuple[Counter, dict, int]:
+    """Total views per item, unique devices per item, and unique devices overall."""
+    totals = Counter(r[key] for r in rows)
+    devices: dict[str, set] = defaultdict(set)
+    for r in rows:
+        if r.get("device_id"):
+            devices[r[key]].add(r["device_id"])
+    overall = len({r["device_id"] for r in rows if r.get("device_id")})
+    return totals, devices, overall
+
+
+# The stats below used to make 2 + 3N (articles) or 2 + 4N (events) synchronous
+# Supabase calls on the event loop: ~95 calls for 31 articles stalled every app
+# request for 15-20 s while the admin looked at stats. Now each table is read once,
+# counted in Python, and the work runs in a worker thread.
+
+def _event_click_stats() -> list[dict]:
+    sb = get_supabase()
+    events = _fetch_all(sb, "events", "id, title, event_date, is_active")
+    events.sort(key=lambda e: e.get("event_date") or "", reverse=True)
+    clicks = Counter(c["event_id"] for c in _fetch_all(sb, "event_clicks", "event_id"))
+    return [{
+        "event_id": e["id"],
+        "title": e["title"],
+        "event_date": e["event_date"],
+        "is_active": e["is_active"],
+        "click_count": clicks.get(e["id"], 0),
+    } for e in events]
+
+
 @admin_router.get("/event-clicks/stats")
 @supabase_query
 async def event_clicks_stats(user: AdminUser = Depends(require_admin)):
     """Aggregated stats for all events (admin only)"""
-    sb = get_supabase()
-
-    # Get all events with click counts
-    events = sb.table("events").select("id, title, event_date, is_active").order(
-        "event_date", desc=True
-    ).execute()
-
-    stats = []
-    for event in events.data:
-        clicks = sb.table("event_clicks").select(
-            "id", count="exact"
-        ).eq("event_id", event["id"]).execute()
-
-        stats.append({
-            "event_id": event["id"],
-            "title": event["title"],
-            "event_date": event["event_date"],
-            "is_active": event["is_active"],
-            "click_count": clicks.count or 0,
-        })
-
-    return stats
+    return await asyncio.to_thread(_event_click_stats)
 
 
 # === View Stats (admin) ===
+
+def _article_view_stats() -> dict:
+    sb = get_supabase()
+    articles = _fetch_all(sb, "articles", "id, title, is_published, created_at")
+    articles.sort(key=lambda a: a.get("created_at") or "", reverse=True)
+    totals, devices, overall = _views_by(_fetch_all(sb, "article_views", "article_id, device_id"), "article_id")
+    likes, dislikes = _reaction_counts(sb, "article")
+    stats = [{
+        "article_id": a["id"],
+        "title": a["title"],
+        "is_published": a["is_published"],
+        "created_at": a["created_at"],
+        "view_count": totals.get(a["id"], 0),
+        "unique_viewers": len(devices.get(a["id"], ())),
+        "likes": likes.get(a["id"], 0),
+        "dislikes": dislikes.get(a["id"], 0),
+    } for a in articles]
+    return {"stats": stats, "total_unique_readers": overall}
+
 
 @admin_router.get("/article-views/stats")
 @supabase_query
 async def article_views_stats(user: AdminUser = Depends(require_admin)):
     """Aggregated article view stats (admin only)"""
+    return await asyncio.to_thread(_article_view_stats)
+
+
+def _event_view_stats() -> dict:
     sb = get_supabase()
-
-    articles = sb.table("articles").select(
-        "id, title, is_published, created_at"
-    ).order("created_at", desc=True).execute()
-
-    # Global unique readers (distinct device_id across ALL article views)
-    all_views = sb.table("article_views").select("device_id").execute()
-    total_unique = len(set(
-        v["device_id"] for v in all_views.data if v.get("device_id")
-    ))
-
-    stats = []
-    for article in articles.data:
-        # Total views
-        views = sb.table("article_views").select(
-            "id", count="exact"
-        ).eq("article_id", article["id"]).execute()
-
-        # Unique viewers (distinct device_id)
-        unique_views = sb.table("article_views").select(
-            "device_id"
-        ).eq("article_id", article["id"]).execute()
-        unique_count = len(set(
-            v["device_id"] for v in unique_views.data if v.get("device_id")
-        ))
-
-        # Reactions
-        reactions = sb.table("content_reactions").select("reaction").eq(
-            "content_type", "article"
-        ).eq("content_id", article["id"]).execute()
-        likes = sum(1 for r in reactions.data if r["reaction"] == "like")
-        dislikes = sum(1 for r in reactions.data if r["reaction"] == "dislike")
-
-        stats.append({
-            "article_id": article["id"],
-            "title": article["title"],
-            "is_published": article["is_published"],
-            "created_at": article["created_at"],
-            "view_count": views.count or 0,
-            "unique_viewers": unique_count,
-            "likes": likes,
-            "dislikes": dislikes,
-        })
-
-    return {"stats": stats, "total_unique_readers": total_unique}
+    events = _fetch_all(sb, "events", "id, title, event_date, is_active")
+    events.sort(key=lambda e: e.get("event_date") or "", reverse=True)
+    totals, devices, overall = _views_by(_fetch_all(sb, "event_views", "event_id, device_id"), "event_id")
+    registrations = Counter(c["event_id"] for c in _fetch_all(sb, "event_clicks", "event_id"))
+    likes, dislikes = _reaction_counts(sb, "event")
+    stats = [{
+        "event_id": e["id"],
+        "title": e["title"],
+        "event_date": e["event_date"],
+        "is_active": e["is_active"],
+        "view_count": totals.get(e["id"], 0),
+        "unique_viewers": len(devices.get(e["id"], ())),
+        "registration_count": registrations.get(e["id"], 0),
+        "likes": likes.get(e["id"], 0),
+        "dislikes": dislikes.get(e["id"], 0),
+    } for e in events]
+    return {"stats": stats, "total_unique_viewers": overall}
 
 
 @admin_router.get("/event-views/stats")
 @supabase_query
 async def event_views_stats(user: AdminUser = Depends(require_admin)):
     """Aggregated event view + registration stats (admin only)"""
-    sb = get_supabase()
-
-    events = sb.table("events").select(
-        "id, title, event_date, is_active"
-    ).order("event_date", desc=True).execute()
-
-    # Global unique viewers (distinct device_id across ALL event views)
-    all_views = sb.table("event_views").select("device_id").execute()
-    total_unique = len(set(
-        v["device_id"] for v in all_views.data if v.get("device_id")
-    ))
-
-    stats = []
-    for event in events.data:
-        # Total views
-        views = sb.table("event_views").select(
-            "id", count="exact"
-        ).eq("event_id", event["id"]).execute()
-
-        # Unique viewers
-        unique_views = sb.table("event_views").select(
-            "device_id"
-        ).eq("event_id", event["id"]).execute()
-        unique_count = len(set(
-            v["device_id"] for v in unique_views.data if v.get("device_id")
-        ))
-
-        # Registration count from event_clicks
-        clicks = sb.table("event_clicks").select(
-            "id", count="exact"
-        ).eq("event_id", event["id"]).execute()
-
-        # Reactions
-        reactions = sb.table("content_reactions").select("reaction").eq(
-            "content_type", "event"
-        ).eq("content_id", event["id"]).execute()
-        likes = sum(1 for r in reactions.data if r["reaction"] == "like")
-        dislikes = sum(1 for r in reactions.data if r["reaction"] == "dislike")
-
-        stats.append({
-            "event_id": event["id"],
-            "title": event["title"],
-            "event_date": event["event_date"],
-            "is_active": event["is_active"],
-            "view_count": views.count or 0,
-            "unique_viewers": unique_count,
-            "registration_count": clicks.count or 0,
-            "likes": likes,
-            "dislikes": dislikes,
-        })
-
-    return {"stats": stats, "total_unique_viewers": total_unique}
+    return await asyncio.to_thread(_event_view_stats)
 
 
 # === Public Endpoints (for mobile apps & website) ===
@@ -1930,6 +1905,21 @@ def _localize_event(row: dict, lang: str) -> dict:
 
 # === Background Tasks ===
 
+def _save_translations(table: str, row_id: str, fresh: dict) -> None:
+    """Merge freshly translated languages into the row's translations.
+
+    The translator skips a language when its request fails. Overwriting the whole
+    column then deleted that language's existing translation, and its readers got
+    the Russian original; this matters because every save of a published article
+    re-translates it. Merging keeps the previous version for any language that
+    didn't come back this time.
+    """
+    sb = get_supabase()
+    current = sb.table(table).select("translations").eq("id", row_id).execute()
+    existing = (current.data[0].get("translations") if current.data else None) or {}
+    sb.table(table).update({"translations": {**existing, **fresh}}).eq("id", row_id).execute()
+
+
 async def _translate_article_task_async(article_id: str, title: str, body: str, language: str):
     """Async background task: translate article and save to DB.
     Called via asyncio.create_task() from endpoints.
@@ -1938,10 +1928,7 @@ async def _translate_article_task_async(article_id: str, title: str, body: str, 
         logger.info(f"Starting translation for article {article_id} (body_len={len(body)})...")
         translations = await translate_article(title, body, language)
         if translations:
-            sb = get_supabase()
-            sb.table("articles").update(
-                {"translations": translations}
-            ).eq("id", article_id).execute()
+            _save_translations("articles", article_id, translations)
             logger.info(f"Translation completed for article {article_id}: {list(translations.keys())}")
         else:
             logger.warning(f"Translation returned empty for article {article_id}")
@@ -1957,10 +1944,7 @@ async def _translate_event_task_async(event_id: str, title: str, description: st
         logger.info(f"Starting translation for event {event_id}...")
         translations = await translate_event(title, description, language)
         if translations:
-            sb = get_supabase()
-            sb.table("events").update(
-                {"translations": translations}
-            ).eq("id", event_id).execute()
+            _save_translations("events", event_id, translations)
             logger.info(f"Translation completed for event {event_id}: {list(translations.keys())}")
         else:
             logger.warning(f"Translation returned empty for event {event_id}")
@@ -1968,8 +1952,13 @@ async def _translate_event_task_async(event_id: str, title: str, description: st
         logger.error(f"Translation failed for event {event_id}: {e}", exc_info=True)
 
 
-async def _send_registration_email(event_title: str, registration_data: dict, to_email: str):
-    """Background task: send email notification about new event registration"""
+def _send_registration_email(event_title: str, registration_data: dict, to_email: str):
+    """Background task: send email notification about new event registration.
+
+    Deliberately a plain def: FastAPI runs sync background tasks in a thread pool.
+    As an async def, smtplib's blocking calls ran on the event loop, and a slow or
+    hung mail server stalled every request to the API.
+    """
     import os
     import smtplib
     from email.mime.text import MIMEText
@@ -1986,7 +1975,11 @@ async def _send_registration_email(event_title: str, registration_data: dict, to
 
     try:
         # Build email body
-        name = f"{registration_data.get('user_name', '')} {registration_data.get('user_surname', '')}".strip() or "Не указано"
+        # `or ''`, not a .get() default: a field sent as null came through as "None None".
+        # Both key styles are accepted, as in the apps (user_name/name, user_surname/surname).
+        first = registration_data.get('user_name') or registration_data.get('name') or ''
+        last = registration_data.get('user_surname') or registration_data.get('surname') or ''
+        name = f"{first} {last}".strip() or "Не указано"
         email = registration_data.get('email') or "Не указан"
         phone = registration_data.get('phone') or "Не указан"
         platform = registration_data.get('platform') or "Не указана"
@@ -2005,7 +1998,7 @@ Email: {email}
         msg["Subject"] = f"Новая регистрация: {event_title}"
         msg.attach(MIMEText(body, "plain", "utf-8"))
 
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as server:
             server.starttls()
             server.login(smtp_user, smtp_password)
             server.send_message(msg)

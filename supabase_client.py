@@ -6,6 +6,7 @@ Auto-reconnects if connection is lost.
 
 import os
 import logging
+from fastapi import HTTPException
 from supabase import create_client, Client, ClientOptions
 
 logger = logging.getLogger(__name__)
@@ -74,6 +75,11 @@ def supabase_query(func):
     async def wrapper(*args, **kwargs):
         try:
             return await func(*args, **kwargs)
+        except HTTPException:
+            # A deliberate 4xx/5xx answer, not a connection problem: re-running the
+            # endpoint would only repeat its side effects (a second Claude call, a
+            # second Pexels search, an orphan auth user in create_user).
+            raise
         except Exception as e:
             error_name = type(e).__name__
             logger.warning(
