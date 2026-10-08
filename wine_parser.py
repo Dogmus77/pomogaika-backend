@@ -366,7 +366,7 @@ class MercadonaParser:
         }
         
         try:
-            response = self.session.post(self.base_url, json=payload)
+            response = self.session.post(self.base_url, json=payload, timeout=15)
             response.raise_for_status()
             data = response.json()
             
@@ -1295,6 +1295,40 @@ class FroizParser:
         return None
 
 
+def _run_parallel(fn, items: list, max_workers: int, timeout: float, label: str) -> list:
+    """Run fn(*item) for every item in a thread pool; return the results that
+    finished within `timeout` seconds.
+
+    One store that hangs must not cost us the stores that answered. as_completed()
+    raises TimeoutError from the iterator itself, and a `with` pool would then still
+    wait for the hung threads on exit, so the pool is shut down without waiting and
+    whatever finished in time is kept.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
+
+    results = []
+    pool = ThreadPoolExecutor(max_workers=max_workers)
+    try:
+        futures = {pool.submit(fn, *item): item for item in items}
+        try:
+            for future in as_completed(futures, timeout=timeout):
+                try:
+                    results.append(future.result())
+                except Exception as e:
+                    print(f"\u26A0\uFE0F {label} {_describe(futures[future])}: {e}")
+        except FuturesTimeout:
+            pending = [_describe(futures[f]) for f in futures if not f.done()]
+            print(f"\u26A0\uFE0F {label}: {len(pending)} task(s) still running after {timeout}s, "
+                  f"keeping {len(results)} finished: {pending}")
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    return results
+
+
+def _describe(item: tuple) -> str:
+    return "/".join(x.__class__.__name__ if hasattr(x, "search_wines") else str(getattr(x, "value", x)) for x in item)
+
+
 class WineAggregator:
     """
     Wine aggregator from all stores.
@@ -1313,8 +1347,6 @@ class WineAggregator:
     
     def search_all(self, wine_type: WineType = WineType.TINTO, limit_per_store: int = 20) -> list[Wine]:
         """Search wines across all stores IN PARALLEL"""
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        
         all_wines = []
         
         def fetch_store(parser):
@@ -1325,23 +1357,14 @@ class WineAggregator:
                 print(f"⚠️ {store_name} error: {e}")
                 return []
         
-        # Fetch all 5 stores simultaneously
-        with ThreadPoolExecutor(max_workers=5) as pool:
-            futures = {pool.submit(fetch_store, p): p for p in self._parsers}
-            for future in as_completed(futures, timeout=20):
-                try:
-                    wines = future.result()
-                    all_wines.extend(wines)
-                except Exception as e:
-                    parser = futures[future]
-                    print(f"⚠️ {parser.__class__.__name__} timeout/error: {e}")
-        
+        # Fetch all stores simultaneously
+        for wines in _run_parallel(fetch_store, [(p,) for p in self._parsers], 6, 20, "search_all"):
+            all_wines.extend(wines)
+
         return all_wines
     
     def search_all_types(self, wine_types: list[WineType] = None, limit_per_store: int = 30) -> list[Wine]:
         """Search ALL wine types across all stores in parallel (one batch)"""
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        
         if wine_types is None:
             wine_types = [WineType.TINTO, WineType.BLANCO, WineType.ROSADO, WineType.CAVA]
         
@@ -1360,16 +1383,9 @@ class WineAggregator:
             for wt in wine_types:
                 tasks.append((parser, wt))
         
-        # Run all 16 tasks in parallel (max 8 workers to not overwhelm)
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            futures = {pool.submit(fetch_task, p, wt): (p, wt) for p, wt in tasks}
-            for future in as_completed(futures, timeout=30):
-                try:
-                    wines = future.result()
-                    all_wines.extend(wines)
-                except Exception as e:
-                    p, wt = futures[future]
-                    print(f"⚠️ {p.__class__.__name__}/{wt.value} timeout: {e}")
+        # Run all tasks in parallel (max 8 workers to not overwhelm)
+        for wines in _run_parallel(fetch_task, tasks, 8, 30, "search_all_types"):
+            all_wines.extend(wines)
         
         print(f"✅ Aggregator: {len(all_wines)} total wines from {len(tasks)} tasks")
         return all_wines
@@ -1379,8 +1395,6 @@ class WineAggregator:
         Supermarket default search returns cheap wines first — these queries
         specifically target Reserva, Gran Reserva, premium regions, etc.
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        
         premium_queries = [
             "vino reserva",
             "vino gran reserva",
@@ -1410,18 +1424,11 @@ class WineAggregator:
                 tasks.append((parser, q))
         
         # Run all premium queries in parallel
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            futures = {pool.submit(fetch_premium, p, q): (p, q) for p, q in tasks}
-            for future in as_completed(futures, timeout=30):
-                try:
-                    wines = future.result()
-                    for w in wines:
-                        if w.id not in seen_ids:
-                            seen_ids.add(w.id)
-                            all_wines.append(w)
-                except Exception as e:
-                    p, q = futures[future]
-                    print(f"⚠️ Premium {p.__class__.__name__}/{q} timeout: {e}")
+        for wines in _run_parallel(fetch_premium, tasks, 8, 30, "search_premium"):
+            for w in wines:
+                if w.id not in seen_ids:
+                    seen_ids.add(w.id)
+                    all_wines.append(w)
         
         print(f"✅ Premium search: {len(all_wines)} unique wines from {len(tasks)} queries")
         return all_wines
