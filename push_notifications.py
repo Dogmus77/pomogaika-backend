@@ -43,10 +43,28 @@ def _init_firebase():
     return None
 
 
-def send_push_to_all(title: str, body: str, data: Optional[dict] = None):
+def _all_tokens(sb) -> list[dict]:
+    """Every registered device, paging past PostgREST's 1000-row default.
+    Without paging, pushes silently reached at most 1000 devices."""
+    rows: list[dict] = []
+    page = 1000
+    while True:
+        batch = sb.table("device_tokens").select(
+            "fcm_token, platform, device_id, language"
+        ).range(len(rows), len(rows) + page - 1).execute().data or []
+        rows.extend(batch)
+        if len(batch) < page:
+            return rows
+
+
+def send_push_to_all(title: str, body: str, data: Optional[dict] = None,
+                     translations: Optional[dict] = None):
     """
-    Send push notification to ALL registered devices.
-    Called in background after article publish / event creation.
+    Send a push notification to ALL registered devices, each in its own language.
+
+    `translations` maps a language code to {"title", "body"}; devices whose language
+    is missing from it (or is the source language) get the original text.
+    Blocking: call through send_push_async.
     """
     from supabase_client import get_supabase
 
@@ -57,76 +75,82 @@ def send_push_to_all(title: str, body: str, data: Optional[dict] = None):
 
     from firebase_admin import messaging
 
-    # Get all device tokens
     sb = get_supabase()
-    result = sb.table("device_tokens").select("fcm_token, platform, device_id").execute()
-    tokens = result.data or []
-
+    tokens = _all_tokens(sb)
     if not tokens:
         logger.info("No device tokens registered, skipping push")
         return {"sent": 0, "failed": 0}
 
-    # Build messages for each token
+    translations = translations or {}
+
+    def build(row: dict) -> "messaging.Message":
+        text = translations.get(row.get("language") or "", {"title": title, "body": body})
+        return messaging.Message(
+            notification=messaging.Notification(title=text["title"], body=text["body"]),
+            data=data or {},
+            token=row["fcm_token"],
+            apns=messaging.APNSConfig(
+                payload=messaging.APNSPayload(aps=messaging.Aps(sound="default", badge=1))
+            ),
+            android=messaging.AndroidConfig(
+                priority="high",
+                notification=messaging.AndroidNotification(
+                    sound="default", channel_id="pomogaika_content",
+                ),
+            ),
+        )
+
     sent = 0
     failed = 0
-    stale_tokens = []
-
-    for token_row in tokens:
-        fcm_token = token_row["fcm_token"]
+    stale: list[str] = []
+    # FCM accepts up to 500 messages per send_each call; sending one by one was
+    # a round trip per device.
+    for i in range(0, len(tokens), 500):
+        chunk = tokens[i:i + 500]
         try:
-            message = messaging.Message(
-                notification=messaging.Notification(
-                    title=title,
-                    body=body,
-                ),
-                data=data or {},
-                token=fcm_token,
-                # iOS-specific config
-                apns=messaging.APNSConfig(
-                    payload=messaging.APNSPayload(
-                        aps=messaging.Aps(
-                            sound="default",
-                            badge=1,
-                        )
-                    )
-                ),
-                # Android-specific config
-                android=messaging.AndroidConfig(
-                    priority="high",
-                    notification=messaging.AndroidNotification(
-                        sound="default",
-                        channel_id="pomogaika_content",
-                    )
-                ),
-            )
-            messaging.send(message)
-            sent += 1
-        except messaging.UnregisteredError:
-            # Token is no longer valid — mark for cleanup
-            stale_tokens.append(token_row["device_id"])
-            failed += 1
+            batch = messaging.send_each([build(row) for row in chunk])
         except Exception as e:
-            logger.error(f"Push failed for {token_row['device_id']}: {e}")
-            failed += 1
+            logger.error(f"Push batch {i // 500} failed entirely: {e}")
+            failed += len(chunk)
+            continue
+        for row, resp in zip(chunk, batch.responses):
+            if resp.success:
+                sent += 1
+            else:
+                failed += 1
+                if isinstance(resp.exception, messaging.UnregisteredError):
+                    stale.append(row["device_id"])
+                else:
+                    logger.error(f"Push failed for {row['device_id']}: {resp.exception}")
 
-    # Clean up stale tokens
-    if stale_tokens:
+    if stale:
         try:
-            for device_id in stale_tokens:
-                sb.table("device_tokens").delete().eq("device_id", device_id).execute()
-            logger.info(f"Cleaned up {len(stale_tokens)} stale push tokens")
+            for i in range(0, len(stale), 100):
+                sb.table("device_tokens").delete().in_("device_id", stale[i:i + 100]).execute()
+            logger.info(f"Cleaned up {len(stale)} stale push tokens")
         except Exception as e:
             logger.error(f"Failed to clean stale tokens: {e}")
 
-    logger.info(f"Push sent: {sent} ok, {failed} failed, {len(stale_tokens)} cleaned")
-    return {"sent": sent, "failed": failed, "cleaned": len(stale_tokens)}
+    by_lang = sorted({row.get("language") or "?" for row in tokens})
+    logger.info(f"Push sent: {sent} ok, {failed} failed, {len(stale)} cleaned, languages {by_lang}")
+    return {"sent": sent, "failed": failed, "cleaned": len(stale), "translated": sorted(translations)}
 
 
-async def send_push_async(title: str, body: str, data: Optional[dict] = None):
-    """Async wrapper — runs send_push_to_all in thread to avoid blocking"""
+async def send_push_async(title: str, body: str, data: Optional[dict] = None,
+                          source_lang: str = "ru"):
+    """Translate the message into the other app languages, then send it in a
+    worker thread (FCM and Supabase calls are blocking)."""
     import asyncio
+    from translation import translate_push
+
+    try:
+        translations = await translate_push(title, body, source_lang)
+    except Exception as e:
+        # A failed translation must never block the push itself.
+        logger.error(f"Push translation failed, sending the original to everyone: {e}")
+        translations = {}
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, send_push_to_all, title, body, data)
+    return await loop.run_in_executor(None, send_push_to_all, title, body, data, translations)
 
 
 async def notify_new_article(article_id: str, title: str):

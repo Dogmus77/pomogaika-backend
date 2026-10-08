@@ -206,3 +206,11 @@ async def translate_event(title: str, description: str | None, source_lang: str)
     for lang in translations:
         logger.info(f"Translated event to {lang}: OK")
     return translations
+
+
+async def translate_push(title: str, body: str, source_lang: str = "ru") -> dict:
+    """Push title/body in every other app language: {"en": {"title", "body"}, ...}.
+    A language whose translation fails is simply absent; those devices get the original."""
+    translations = await _translate_to_all({"title": title, "body": body}, source_lang)
+    logger.info(f"Push translated to {sorted(translations)}")
+    return translations
