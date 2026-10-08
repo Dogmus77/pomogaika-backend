@@ -5,7 +5,7 @@ Uses Supabase Auth for login, custom admin_users table for roles
 
 from fastapi import Header, HTTPException, Depends
 from typing import Optional
-from supabase_client import get_supabase
+from supabase_client import get_supabase, get_auth_client
 
 
 class AdminUser:
@@ -37,8 +37,8 @@ async def get_current_user(authorization: str = Header(...)) -> AdminUser:
     sb = get_supabase()
 
     try:
-        # Verify token with Supabase Auth
-        user_response = sb.auth.get_user(token)
+        # Verify token with Supabase Auth (separate client - see supabase_client.py)
+        user_response = get_auth_client().auth.get_user(token)
         auth_user = user_response.user
         if not auth_user:
             raise HTTPException(status_code=401, detail="Invalid token")

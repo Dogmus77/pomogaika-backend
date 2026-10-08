@@ -13,7 +13,7 @@ import uuid as uuid_mod
 import io
 import logging
 
-from supabase_client import get_supabase, supabase_query
+from supabase_client import get_supabase, new_auth_client, supabase_query
 from auth import AdminUser, get_current_user, require_admin
 from translation import (translate_article, translate_event, translate_expert,
                          ATTRIBUTION_PREFIX, ATTRIBUTION_FOOTER_RE)
@@ -35,6 +35,10 @@ public_router = APIRouter(tags=["content"])
 class LoginRequest(BaseModel):
     email: str
     password: str
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
 
 
 class ArticleCreate(BaseModel):
@@ -156,7 +160,9 @@ async def admin_login(req: LoginRequest):
     sb = get_supabase()
 
     try:
-        auth_response = sb.auth.sign_in_with_password({
+        # Throwaway client: signing in on the shared one would switch every backend
+        # DB request to this admin's JWT (see supabase_client.py).
+        auth_response = new_auth_client().auth.sign_in_with_password({
             "email": req.email,
             "password": req.password,
         })
@@ -193,11 +199,17 @@ async def admin_login(req: LoginRequest):
 
 @admin_router.post("/refresh")
 @supabase_query
-async def refresh_token(refresh_token: str):
-    """Refresh an expired JWT token"""
-    sb = get_supabase()
+async def refresh_token(body: Optional[RefreshRequest] = None, refresh_token: Optional[str] = None):
+    """Refresh an expired JWT token.
+
+    The token comes in the JSON body. The query-string form is still accepted for
+    admin builds deployed before 2026-10-08, but it puts the token in access logs.
+    """
+    token = body.refresh_token if body else refresh_token
+    if not token:
+        raise HTTPException(status_code=422, detail="refresh_token is required")
     try:
-        response = sb.auth.refresh_session(refresh_token)
+        response = new_auth_client().auth.refresh_session(token)
         return {
             "token": response.session.access_token,
             "refresh_token": response.session.refresh_token,

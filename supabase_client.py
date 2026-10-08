@@ -6,7 +6,7 @@ Auto-reconnects if connection is lost.
 
 import os
 import logging
-from supabase import create_client, Client
+from supabase import create_client, Client, ClientOptions
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,29 @@ def get_supabase() -> Client:
     if _client is None:
         _client = _create_client()
     return _client
+
+
+# Supabase Auth calls (sign-in, refresh, token checks) must NOT run on the shared
+# get_supabase() client. supabase-py keeps the session it signs in with and then
+# switches that client's DB requests from the service key to the user's 1-hour JWT,
+# so the whole backend ran as the last admin who logged in. Once that token expired,
+# any admin with a still-valid token of their own got a 500 from get_current_user.
+_AUTH_OPTIONS = ClientOptions(auto_refresh_token=False, persist_session=False)
+_auth_client: Client | None = None
+
+
+def get_auth_client() -> Client:
+    """Shared client for stateless auth calls only (get_user with an explicit JWT)."""
+    global _auth_client
+    if _auth_client is None:
+        _auth_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY, options=_AUTH_OPTIONS)
+    return _auth_client
+
+
+def new_auth_client() -> Client:
+    """Throwaway client for calls that start a session (sign-in, refresh), so no
+    session state is ever shared between requests or users."""
+    return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY, options=_AUTH_OPTIONS)
 
 
 def reset_supabase():
