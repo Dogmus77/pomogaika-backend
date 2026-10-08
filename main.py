@@ -83,7 +83,7 @@ async def _warmup_cache():
 
 _LATEST_VERSIONS = {
     "ios": "2.2.1",
-    "android": "2.2.1"
+    "android": "2.3.0"
 }
 
 @app.get("/version")
