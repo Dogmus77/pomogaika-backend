@@ -3,7 +3,14 @@ Pomogaika Wine API
 Production-ready backend with real store data
 """
 
-from fastapi import FastAPI, Query, HTTPException
+import logging
+
+# Without this the root logger has no handler, Python's last-resort handler prints
+# WARNING and above only, and every logger.info() in the backend never reached
+# Render's logs.
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+from fastapi import FastAPI, Query, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -14,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from sommelier import SommelierEngine
 from wine_parser import WineAggregator, WineType, Wine as ParserWine
 from content_routes import admin_router, public_router
+from auth import require_admin
 
 app = FastAPI(
     title="Pomogaika Wine API",
@@ -166,62 +174,74 @@ def fetch_wines_sync(postal_code: str = "46001") -> list[ParserWine]:
     return all_wines
 
 
-async def get_wines(postal_code: str = "46001") -> list[WineResponse]:
-    """Async fetch wines with caching"""
+CACHE_TTL_SECONDS = 1800        # refresh the catalogue every 30 minutes
+STORE_CARRYOVER_SECONDS = 6 * 3600  # keep a silent store's last wines for up to 6 hours
+_refresh_tasks: set = set()
+
+
+def _keep_previous_for_silent_stores(fresh: list, previous: list, store_updated: dict, now: float) -> list:
+    """A store that returned nothing this time (blocked, down, timed out) keeps its
+    previous wines for a while instead of vanishing from every result for 30 minutes."""
+    answered = {w.store for w in fresh}
+    for store in answered:
+        store_updated[store] = now
+    kept = [w for w in previous
+            if w.store not in answered and now - store_updated.get(w.store, 0) < STORE_CARRYOVER_SECONDS]
+    if kept:
+        print(f"\u267B\uFE0F Keeping {len(kept)} cached wines for silent stores: {sorted({w.store for w in kept})}")
+    return fresh + kept
+
+
+async def _refresh_wines(postal_code: str) -> None:
+    """Fetch the catalogue and swap it into the cache. Never raises.
+    The caller must set wine_cache["is_loading"] = True before scheduling this."""
     import time
-    
-    # Check cache (30 min)
-    if wine_cache["wines"] and wine_cache["last_update"]:
-        age = time.time() - wine_cache["last_update"]
-        if age < 1800:  # 30 min
-            return wine_cache["wines"]
-        print(f"♻️ Cache expired ({age:.0f}s old), refreshing...")
-    
-    # Prevent multiple simultaneous fetches
-    if wine_cache["is_loading"]:
-        print("⏳ Already loading, returning current cache")
-        return wine_cache["wines"]
-    
-    wine_cache["is_loading"] = True
-    
-    # Get fresh data
-    loop = asyncio.get_event_loop()
     try:
+        loop = asyncio.get_event_loop()
         parser_wines = await loop.run_in_executor(executor, fetch_wines_sync, postal_code)
-        
-        wines = []
-        for pw in parser_wines:
-            wines.append(WineResponse(
-                id=pw.id,
-                name=pw.name,
-                brand=pw.brand,
-                price=pw.price,
-                price_per_liter=pw.price_per_liter,
-                store=pw.store,
-                url=pw.url,
-                image_url=pw.image_url,
-                ean=pw.ean,
-                region=pw.region,
-                wine_type=pw.wine_type,
-                discount_price=pw.discount_price,
-                discount_percent=pw.discount_percent
-            ))
-        
-        # Update cache
-        wine_cache["wines"] = wines
-        wine_cache["last_update"] = time.time()
-        print(f"✅ Cache updated: {len(wines)} wines")
-        
-        return wines
-        
+        fresh = [WineResponse(
+            id=pw.id, name=pw.name, brand=pw.brand, price=pw.price,
+            price_per_liter=pw.price_per_liter, store=pw.store, url=pw.url,
+            image_url=pw.image_url, ean=pw.ean, region=pw.region, wine_type=pw.wine_type,
+            discount_price=pw.discount_price, discount_percent=pw.discount_percent,
+        ) for pw in parser_wines]
+        now = time.time()
+        wines = _keep_previous_for_silent_stores(
+            fresh, wine_cache["wines"], wine_cache.setdefault("store_updated", {}), now)
+        if wines:
+            wine_cache["wines"] = wines
+            wine_cache["last_update"] = now
+            print(f"\u2705 Cache updated: {len(wines)} wines ({len(fresh)} fresh)")
+        else:
+            print("\u274C Refresh returned no wines, keeping the previous cache")
     except Exception as e:
-        print(f"❌ Error fetching wines: {e}")
-        # Return cache if available
-        if wine_cache["wines"]:
-            return wine_cache["wines"]
-        return []
+        print(f"\u274C Error fetching wines: {e}")
     finally:
         wine_cache["is_loading"] = False
+
+
+async def get_wines(postal_code: str = "46001") -> list[WineResponse]:
+    """Wines from the cache. A stale cache is served immediately and refreshed in the
+    background; only an empty cache (cold start) makes the caller wait for a fetch."""
+    import time
+
+    if wine_cache["wines"]:
+        age = time.time() - (wine_cache["last_update"] or 0)
+        if age >= CACHE_TTL_SECONDS and not wine_cache["is_loading"]:
+            print(f"\u267B\uFE0F Cache is {age:.0f}s old, refreshing in the background")
+            wine_cache["is_loading"] = True   # set before scheduling: no second refresh can start
+            task = asyncio.create_task(_refresh_wines(postal_code))
+            _refresh_tasks.add(task)
+            task.add_done_callback(_refresh_tasks.discard)
+        return wine_cache["wines"]
+
+    # Nothing cached yet
+    if wine_cache["is_loading"]:
+        print("\u23F3 Already loading, returning current cache")
+        return wine_cache["wines"]
+    wine_cache["is_loading"] = True
+    await _refresh_wines(postal_code)
+    return wine_cache["wines"]
 
 
 # === Endpoints ===
@@ -299,7 +319,9 @@ async def recommend_wines(
         print("⚠️ Cache warmup timeout, proceeding with what we have")
     
     # 1. Get expert recommendations
-    expert_recs = sommelier.get_recommendations(dish, cooking_method, meal_time, cuisine)
+    # lang goes to the engine: its translation table covers every description it can
+    # produce (the old duplicate table in this file missed 8, which came back in English).
+    expert_recs = sommelier.get_recommendations(dish, cooking_method, meal_time, cuisine, lang=lang)
     
     if not expert_recs:
         raise HTTPException(status_code=400, detail="Could not find recommendations")
@@ -343,17 +365,22 @@ async def recommend_wines(
         
         return min(score, 100)
     
-    # 6. Add scores
-    for wine in filtered:
-        wine.match_score = score_wine(wine)
-        wine.expert_note = get_expert_note(wine, primary_rec, lang)
-    
+    # 6. Add scores — on copies: these are the cached objects that /search also returns,
+    # and writing into them leaked this dish's match scores and notes into everyone's search.
+    scored = [
+        w.model_copy(update={
+            "match_score": score_wine(w),
+            "expert_note": get_expert_note(w, primary_rec, lang),
+        })
+        for w in filtered
+    ]
+
     # 7. Store-diverse selection: ensure each store is represented
-    scored_wines = _diverse_selection(filtered, limit)
+    scored_wines = _diverse_selection(scored, limit)
     
     return RecommendationResponse(
         total=len(filtered),
-        expert_summary=translate_summary(primary_rec.description, lang),
+        expert_summary=primary_rec.description,
         recommended_style=primary_rec.style.value,
         recommended_grapes=primary_rec.grape_varieties,
         recommended_regions=primary_rec.regions,
@@ -403,232 +430,6 @@ def _diverse_selection(wines: list, limit: int, min_per_store: int = 3) -> list:
 
 # === Localization ===
 
-SUMMARY_TRANSLATIONS = {
-    "Fresh white with minerality enhances raw fish": {
-        "ru": "Свежее белое с минеральностью — идеально к сырой рыбе",
-        "uk": "Свіже біле з мінеральністю — ідеально до сирої риби",
-        "be": "Свежае белае з мінеральнасцю — ідэальна да сырой рыбы",
-        "en": "Fresh white with minerality enhances raw fish",
-        "es": "Blanco fresco con mineralidad — ideal para pescado crudo",
-    },
-    "Cava freshness is classic with raw fish": {
-        "ru": "Свежесть Кавы — классика к сырой рыбе",
-        "uk": "Свіжість Кави — класика до сирої риби",
-        "be": "Свежасць Кавы — класіка да сырой рыбы",
-        "en": "Cava freshness is classic with raw fish",
-        "es": "La frescura del Cava es clásica con pescado crudo",
-    },
-    "Delicate steamed fish needs an elegant wine": {
-        "ru": "Деликатная рыба на пару требует элегантного вина",
-        "uk": "Делікатна риба на парі потребує елегантного вина",
-        "be": "Далікатная рыба на пары патрабуе элегантнага віна",
-        "en": "Delicate steamed fish needs an elegant wine",
-        "es": "El pescado al vapor necesita un vino elegante",
-    },
-    "Grilling adds intensity - needs fuller white": {
-        "ru": "Гриль добавляет интенсивности — нужно плотное белое",
-        "uk": "Гриль додає інтенсивності — потрібне щільне біле",
-        "be": "Грыль дадае інтэнсіўнасці — патрэбна шчыльнае белае",
-        "en": "Grilling adds intensity - needs fuller white",
-        "es": "La parrilla añade intensidad — necesita blanco con cuerpo",
-    },
-    "Rose is versatile with grilled fish": {
-        "ru": "Розовое универсально к рыбе на гриле",
-        "uk": "Рожеве універсальне до риби на грилі",
-        "be": "Ружовае ўніверсальнае да рыбы на грылі",
-        "en": "Rosé is versatile with grilled fish",
-        "es": "El rosado es versátil con pescado a la parrilla",
-    },
-    "Tomato sauce needs wine with good acidity": {
-        "ru": "К томатному соусу — вино с хорошей кислотностью",
-        "uk": "До томатного соусу — вино з гарною кислотністю",
-        "be": "Да таматнага соусу — віно з добрай кіслотнасцю",
-        "en": "Tomato sauce needs wine with good acidity",
-        "es": "La salsa de tomate necesita vino con buena acidez",
-    },
-    "Light Mencia - bold but successful pairing": {
-        "ru": "Лёгкая Менсия — смелое, но удачное сочетание",
-        "uk": "Легка Менсія — сміливе, але вдале поєднання",
-        "be": "Лёгкая Менсія — смелае, але ўдалае спалучэнне",
-        "en": "Light Mencía — bold but successful pairing",
-        "es": "Mencía ligera — maridaje atrevido pero exitoso",
-    },
-    "Creamy sauce needs oaked white with body": {
-        "ru": "К сливочному соусу — выдержанное белое с телом",
-        "uk": "До вершкового соусу — витримане біле з тілом",
-        "be": "Да смятанкавага соусу — вытрыманае белае з целам",
-        "en": "Creamy sauce needs oaked white with body",
-        "es": "La salsa cremosa necesita blanco con crianza y cuerpo",
-    },
-    "Classic: grilled steak + Tempranillo Crianza": {
-        "ru": "Классика: стейк на гриле + Темпранильо Крианса",
-        "uk": "Класика: стейк на грилі + Темпранільо Кріанса",
-        "be": "Класіка: стэйк на грылі + Тэмпранільё Крыянса",
-        "en": "Classic: grilled steak + Tempranillo Crianza",
-        "es": "Clásico: chuletón a la parrilla + Tempranillo Crianza",
-    },
-    "For rich meat - powerful Priorat": {
-        "ru": "Для насыщенного мяса — мощный Приорат",
-        "uk": "Для насиченого м'яса — потужний Пріорат",
-        "be": "Для насычанага мяса — магутны Прыярат",
-        "en": "For rich meat — powerful Priorat",
-        "es": "Para carne rica — un potente Priorat",
-    },
-    "Roasted meat + aged Tempranillo - perfect": {
-        "ru": "Запечённое мясо + выдержанное Темпранильо — идеально",
-        "uk": "Запечене м'ясо + витримане Темпранільо — ідеально",
-        "be": "Запечанае мяса + вытрыманае Тэмпранільё — ідэальна",
-        "en": "Roasted meat + aged Tempranillo — perfect",
-        "es": "Carne asada + Tempranillo envejecido — perfecto",
-    },
-    "Stewed meat needs rich wine with tannins": {
-        "ru": "Тушёное мясо требует насыщенного вина с танинами",
-        "uk": "Тушковане м'ясо потребує насиченого вина з танінами",
-        "be": "Тушанае мяса патрабуе насычанага віна з танінамі",
-        "en": "Stewed meat needs rich wine with tannins",
-        "es": "El estofado necesita vino con cuerpo y taninos",
-    },
-    "Spicy meat loves fruity Garnacha": {
-        "ru": "К острому мясу — фруктовая Гарнача",
-        "uk": "До гострого м'яса — фруктова Гарнача",
-        "be": "Да вострага мяса — фруктовая Гарнача",
-        "en": "Spicy meat loves fruity Garnacha",
-        "es": "La carne especiada adora la Garnacha afrutada",
-    },
-    "Tomato sauce pairs well with Crianza": {
-        "ru": "Томатный соус отлично сочетается с Крианса",
-        "uk": "Томатний соус чудово поєднується з Кріанса",
-        "be": "Таматны соус выдатна спалучаецца з Крыянса",
-        "en": "Tomato sauce pairs well with Crianza",
-        "es": "La salsa de tomate marida bien con Crianza",
-    },
-    "Creamy sauce needs softer red wine": {
-        "ru": "К сливочному соусу — мягкое красное вино",
-        "uk": "До вершкового соусу — м'яке червоне вино",
-        "be": "Да смятанкавага соусу — мяккае чырвонае віно",
-        "en": "Creamy sauce needs softer red wine",
-        "es": "La salsa cremosa necesita un tinto suave",
-    },
-    "Grilled poultry loves light fruity reds": {
-        "ru": "Птица на гриле любит лёгкие фруктовые красные",
-        "uk": "Птиця на грилі любить легкі фруктові червоні",
-        "be": "Птушка на грылі любіць лёгкія фруктовыя чырвоныя",
-        "en": "Grilled poultry loves light fruity reds",
-        "es": "Las aves a la parrilla adoran tintos ligeros y afrutados",
-    },
-    "Oaked white is elegant with grilled chicken": {
-        "ru": "Выдержанное белое элегантно с курицей гриль",
-        "uk": "Витримане біле елегантне з курчам на грилі",
-        "be": "Вытрыманае белае элегантнае з курыцай грыль",
-        "en": "Oaked white is elegant with grilled chicken",
-        "es": "Un blanco con barrica es elegante con pollo a la parrilla",
-    },
-    "Roast chicken pairs with medium reds": {
-        "ru": "Запечённая курица сочетается со средними красными",
-        "uk": "Запечена курка поєднується з середніми червоними",
-        "be": "Запечаная курыца спалучаецца з сярэднімі чырвонымі",
-        "en": "Roast chicken pairs with medium reds",
-        "es": "El pollo asado combina con tintos medios",
-    },
-    "Creamy chicken needs rich oaked white": {
-        "ru": "Курица в сливках требует насыщенного белого с дубом",
-        "uk": "Курка у вершках потребує насиченого білого з дубом",
-        "be": "Курыца ў смятанцы патрабуе насычанага белага з дубам",
-        "en": "Creamy chicken needs rich oaked white",
-        "es": "El pollo en crema necesita blanco con crianza en barrica",
-    },
-    "Rose is perfect with grilled vegetables": {
-        "ru": "Розовое идеально с овощами на гриле",
-        "uk": "Рожеве ідеальне з овочами на грилі",
-        "be": "Ружовае ідэальнае з гароднінай на грылі",
-        "en": "Rosé is perfect with grilled vegetables",
-        "es": "El rosado es perfecto con verduras a la parrilla",
-    },
-    "Light white for delicate steamed veggies": {
-        "ru": "Лёгкое белое для деликатных овощей на пару",
-        "uk": "Легке біле для делікатних овочів на парі",
-        "be": "Лёгкае белае для далікатнай гародніны на пары",
-        "en": "Light white for delicate steamed veggies",
-        "es": "Blanco ligero para verduras al vapor",
-    },
-    "Tomato dishes pair beautifully with rose": {
-        "ru": "Блюда с томатом прекрасно сочетаются с розовым",
-        "uk": "Страви з томатом чудово поєднуються з рожевим",
-        "be": "Стравы з таматам цудоўна спалучаюцца з ружовым",
-        "en": "Tomato dishes pair beautifully with rosé",
-        "es": "Los platos con tomate combinan perfectamente con rosado",
-    },
-    "Tomato pasta loves Spanish Crianza": {
-        "ru": "Паста с томатом любит испанскую Крианса",
-        "uk": "Паста з томатом любить іспанську Кріанса",
-        "be": "Паста з таматам любіць іспанскую Крыянса",
-        "en": "Tomato pasta loves Spanish Crianza",
-        "es": "La pasta con tomate adora un Crianza español",
-    },
-    "Rich creamy pasta needs oaked white": {
-        "ru": "Паста в сливочном соусе требует белого с дубом",
-        "uk": "Паста у вершковому соусі потребує білого з дубом",
-        "be": "Паста ў смятанкавым соусе патрабуе белага з дубам",
-        "en": "Rich creamy pasta needs oaked white",
-        "es": "La pasta cremosa necesita blanco con barrica",
-    },
-    "Grilled cheese with fruity young red": {
-        "ru": "Сыр на гриле с фруктовым молодым красным",
-        "uk": "Сир на грилі з фруктовим молодим червоним",
-        "be": "Сыр на грылі з фруктовым маладым чырвоным",
-        "en": "Grilled cheese with fruity young red",
-        "es": "Queso a la parrilla con tinto joven afrutado",
-    },
-    "Fresh white wine for fish": {
-        "ru": "Свежее белое вино к рыбе",
-        "uk": "Свіже біле вино до риби",
-        "be": "Свежае белае віно да рыбы",
-        "en": "Fresh white wine for fish",
-        "es": "Vino blanco fresco para pescado",
-    },
-    "Red Tempranillo - classic with meat": {
-        "ru": "Красное Темпранильо — классика к мясу",
-        "uk": "Червоне Темпранільо — класика до м'яса",
-        "be": "Чырвонае Тэмпранільё — класіка да мяса",
-        "en": "Red Tempranillo — classic with meat",
-        "es": "Tempranillo tinto — clásico con carne",
-    },
-    "Light red pairs well with poultry": {
-        "ru": "Лёгкое красное хорошо сочетается с птицей",
-        "uk": "Легке червоне добре поєднується з птицею",
-        "be": "Лёгкае чырвонае добра спалучаецца з птушкай",
-        "en": "Light red pairs well with poultry",
-        "es": "Un tinto ligero combina bien con aves",
-    },
-    "Fresh Verdejo white for vegetables": {
-        "ru": "Свежий белый Вердехо к овощам",
-        "uk": "Свіжий білий Вердехо до овочів",
-        "be": "Свежы белы Вердэхо да гародніны",
-        "en": "Fresh Verdejo white for vegetables",
-        "es": "Verdejo fresco para verduras",
-    },
-    "Versatile red for pasta": {
-        "ru": "Универсальное красное к пасте",
-        "uk": "Універсальне червоне до пасти",
-        "be": "Універсальнае чырвонае да пасты",
-        "en": "Versatile red for pasta",
-        "es": "Tinto versátil para pasta",
-    },
-    "Aged red wine for cheese": {
-        "ru": "Выдержанное красное к сыру",
-        "uk": "Витримане червоне до сиру",
-        "be": "Вытрыманае чырвонае да сыру",
-        "en": "Aged red wine for cheese",
-        "es": "Tinto envejecido para queso",
-    },
-    "Cava - perfect choice for aperitivo": {
-        "ru": "Кава — идеальный выбор для аперитива",
-        "uk": "Кава — ідеальний вибір для аперитиву",
-        "be": "Кава — ідэальны выбар для аперытыву",
-        "en": "Cava — perfect choice for aperitif",
-        "es": "Cava — elección perfecta para el aperitivo",
-    },
-}
 
 REGION_NOTES = {
     "Rioja": {
@@ -713,13 +514,6 @@ DEFAULT_NOTE = {
     "en": "Excellent choice for your dish",
     "es": "Excelente elección para tu plato",
 }
-
-
-def translate_summary(description: str, lang: str) -> str:
-    """Translate sommelier summary to target language"""
-    if description in SUMMARY_TRANSLATIONS:
-        return SUMMARY_TRANSLATIONS[description].get(lang, SUMMARY_TRANSLATIONS[description].get("en", description))
-    return description
 
 
 def get_expert_note(wine: WineResponse, rec, lang: str = "ru") -> str:
@@ -824,7 +618,7 @@ async def get_stores():
 
 
 @app.get("/debug/store/{store_name}")
-async def debug_store(store_name: str):
+async def debug_store(store_name: str, user=Depends(require_admin)):
     """Debug endpoint: test individual store parser"""
     import traceback
     
