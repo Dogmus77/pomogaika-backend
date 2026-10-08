@@ -715,7 +715,8 @@ async def generate_article(
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
 
     background_tasks.add_task(_generate_article_task, api_key)
-    return {"status": "generation_started", "message": "Article is being generated in background"}
+    return {"status": "generation_started", "message": "Article is being generated in background",
+            "model": _article_model()}
 
 
 def _fetch_stock_image(query: str) -> Optional[dict]:
@@ -932,6 +933,16 @@ async def refresh_article_image(
     }
 
 
+# Model for article generation. ANTHROPIC_MODEL on Render overrides it, but moving
+# between model generations is not config-only: 4.x -> 5.x changed the response
+# shape (thinking blocks) and token counts, which _generate_article_task handles.
+ARTICLE_MODEL_DEFAULT = "claude-sonnet-5-5"
+
+
+def _article_model() -> str:
+    return os.environ.get("ANTHROPIC_MODEL", ARTICLE_MODEL_DEFAULT)
+
+
 async def _generate_article_task(api_key: str):
     """Background task: generate article with Claude, save to DB, auto-translate."""
     import anthropic
@@ -952,17 +963,23 @@ async def _generate_article_task(api_key: str):
             return
         expert_id = nikolay["id"]
 
-        # Generate with Claude
-        client = anthropic.Anthropic(api_key=api_key)
-        # Model is configurable via ANTHROPIC_MODEL env var so a future model
-        # retirement can be fixed in the Render dashboard without a code change.
-        # Default is a current model; the previously hardcoded
-        # claude-sonnet-4-20250514 (Sonnet 4.0, May 2025) was retired ~June 2026
-        # and silently broke generation (the except below only logs to Render).
-        model = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
-        message = client.messages.create(
+        # Generate with Claude. Async client: this runs on the event loop, and a
+        # sync call would stall every other API request for the whole generation.
+        client = anthropic.AsyncAnthropic(api_key=api_key)
+        model = _article_model()
+        # Server-side refusal fallback is model-specific (e.g. Haiku 5.5 has none),
+        # so it is only sent for the default model it was set up for.
+        fallback_kwargs = (
+            {"betas": ["server-side-fallback-2026-07-01"], "fallbacks": "default"}
+            if model == ARTICLE_MODEL_DEFAULT else {}
+        )
+        message = await client.beta.messages.create(
             model=model,
-            max_tokens=2000,
+            # Thinking is on by default on 5.x models and counts toward this
+            # ceiling, and their tokenizer counts Cyrillic ~30% longer than 4.x.
+            # Only generated tokens are billed, not the ceiling.
+            max_tokens=16000,
+            **fallback_kwargs,
             messages=[{
                 "role": "user",
                 "content": f"""Ты — Николай, AI-сомелье и винный эксперт с 15-летним стажем. Ты пишешь статьи для приложения Pomogaika — помощник по выбору вина в испанских супермаркетах (Consum, Mercadona, Masymas, DIA, Condis).
@@ -986,7 +1003,14 @@ BODY:
             }]
         )
 
-        response_text = message.content[0].text.strip()
+        # A truncated or declined reply must not be saved as a draft.
+        if message.stop_reason != "end_turn":
+            logger.error(f"Generate article: model={message.model} stop_reason={message.stop_reason} — nothing saved")
+            return
+
+        # Read text blocks by type: on 5.x models the reply opens with a thinking
+        # block (and may carry a fallback marker), so content[0] is not the text.
+        response_text = "".join(b.text for b in message.content if b.type == "text").strip()
 
         # Parse response
         title = ""
@@ -1069,7 +1093,7 @@ BODY:
 
         if result.data:
             article_id = result.data[0]['id']
-            logger.info(f"Generated article: '{title}' (id: {article_id})")
+            logger.info(f"Generated article: '{title}' (id: {article_id}, model: {message.model})")
             # Auto-translate the generated article
             try:
                 translations = await translate_article(title, body, "ru")
