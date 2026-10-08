@@ -1,236 +1,178 @@
 """
-Translation service using MyMemory API
-Free tier: 5000 chars/day (anonymous), 50000 chars/day (with email)
-Same approach as NatureSpot project
+Translation service using Claude Haiku 5.5.
+
+Replaced MyMemory (2026-10-08). MyMemory was free machine translation with a
+50K chars/day quota, and long texts had to be cut into 1500-char chunks, which
+lost context between paragraphs and broke Markdown; Belarusian was the weakest.
+Haiku translates each text whole, keeps the Markdown, and translating one
+article into all four languages costs about half a cent.
+
+Public API (translate_article / translate_expert / translate_event) is
+unchanged, so callers in content_routes.py don't depend on the provider.
 """
 
-import httpx
 import asyncio
+import json
 import logging
+import re
+
+import anthropic
 
 logger = logging.getLogger(__name__)
 
-MYMEMORY_URL = "https://api.mymemory.translated.net/get"
-MYMEMORY_EMAIL = "pomogaika.app@gmail.com"  # for 50K chars/day limit
-
-# Language codes for MyMemory API
-LANG_CODES = {
-    "en": "en-GB",
-    "es": "es-ES",
-    "ru": "ru-RU",
-    "uk": "uk-UA",
-    "be": "be-BY",
-}
+TRANSLATION_MODEL = "claude-haiku-5-5"
 
 # All supported app languages
 ALL_LANGUAGES = ["en", "es", "ru", "uk", "be"]
 
-# Delay between API calls to respect rate limits (ms)
-API_DELAY_SEC = 0.3
-MIN_TEXT_LENGTH = 3
-REQUEST_TIMEOUT = 10.0
-# Max chars per single API request (MyMemory limit with email is ~10K,
-# but we keep it lower to stay safe with URL encoding on fallback)
-MAX_CHUNK_CHARS = 1500
+# Spelled out for the model: "uk"/"be" alone invite a slide into Russian.
+LANG_NAMES = {
+    "en": "English",
+    "es": "Spanish as spoken in Spain",
+    "ru": "Russian",
+    "uk": "Ukrainian (українська мова), never Russian",
+    "be": "Belarusian (беларуская мова), never Russian",
+}
+
+# Photo-credit footer that content_routes appends to article bodies:
+#   "\n\n---\n\n*Фото: [Name](url) / [Pexels](url)*"   (label localized per language)
+# Kept here so content_routes and the translator share one copy.
+ATTRIBUTION_PREFIX = {
+    "ru": "Фото",
+    "uk": "Фото",
+    "be": "Фота",
+    "en": "Photo",
+    "es": "Foto",
+}
+# Matches the footer at the end of a body in any supported language; it keys off
+# the localized label, so it matches regardless of photo source.
+ATTRIBUTION_FOOTER_RE = re.compile(
+    r"\s*\n\n---\n\n\*(?:Фото|Фота|Photo|Foto):.*?\*\s*$",
+    re.DOTALL,
+)
+
+SYSTEM_PROMPT = """You translate content for Pomogaika, an app that helps people choose wine in Spanish supermarkets (Consum, Mercadona, Masymas, DIA, Condis, Froiz).
+
+Translate the value of every field in the JSON you are given, and return the same fields.
+
+- Keep the meaning and the friendly, unpretentious voice. It should read as if written in the target language, not translated.
+- Preserve the Markdown exactly: **bold**, *italic*, headings, lists, blank lines between paragraphs, --- separators and links. Translate link text, never change a URL.
+- Keep wine names, grape varieties, D.O. regions, store names and brands as written.
+- Keep people's names as written."""
+
+_client: anthropic.AsyncAnthropic | None = None
 
 
-async def check_quota() -> bool:
-    """Quick check if MyMemory quota is still available.
-    Returns True if quota OK, False if exhausted (429).
+def _get_client() -> anthropic.AsyncAnthropic:
+    # Created lazily so importing this module never needs ANTHROPIC_API_KEY.
+    global _client
+    if _client is None:
+        _client = anthropic.AsyncAnthropic()
+    return _client
+
+
+async def _translate_fields(fields: dict[str, str], source_lang: str, target_lang: str) -> dict[str, str] | None:
     """
-    try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            resp = await client.post(
-                MYMEMORY_URL,
-                data={
-                    "q": "тест",
-                    "langpair": "ru-RU|en-GB",
-                    "de": MYMEMORY_EMAIL,
-                }
-            )
-            data = resp.json()
-            if data.get("responseStatus") == 429:
-                logger.error("MyMemory daily quota exhausted!")
-                return False
-            return True
-    except Exception as e:
-        logger.error(f"Quota check failed: {e}")
-        return True  # assume OK on error, let real translation handle it
-
-
-async def translate_text(text: str, source_lang: str, target_lang: str) -> str | None:
+    Translate a set of named text fields in one request.
+    Returns {field: translation} with every field present, or None on failure.
     """
-    Translate a single text chunk using MyMemory API (POST to avoid URL length limits).
-    Returns translated text or None on failure.
-    """
-    if not text or len(text.strip()) < MIN_TEXT_LENGTH:
+    fields = {k: v for k, v in fields.items() if v and v.strip()}
+    if not fields:
         return None
-
     if source_lang == target_lang:
-        return text
+        return fields
 
-    source_code = LANG_CODES.get(source_lang, source_lang)
-    target_code = LANG_CODES.get(target_lang, target_lang)
-    langpair = f"{source_code}|{target_code}"
+    schema = {
+        "type": "object",
+        "properties": {name: {"type": "string"} for name in fields},
+        "required": list(fields),
+        "additionalProperties": False,
+    }
+    pair = f"{source_lang}->{target_lang}"
 
     try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            # Use POST to avoid URL length limits with long Cyrillic texts
-            response = await client.post(
-                MYMEMORY_URL,
-                data={
-                    "q": text,
-                    "langpair": langpair,
-                    "de": MYMEMORY_EMAIL,
-                }
-            )
-            data = response.json()
-
-            status = data.get("responseStatus")
-            if status == 429:
-                logger.error(
-                    f"MyMemory QUOTA EXHAUSTED for {langpair}: "
-                    f"daily limit reached. Translation will resume tomorrow."
-                )
-                return None
-
-            if status != 200:
-                logger.warning(
-                    f"MyMemory error for {langpair}: status={status}, "
-                    f"text_len={len(text)}, response={str(data)[:200]}"
-                )
-                return None
-
-            translated = data.get("responseData", {}).get("translatedText", "")
-
-            # Skip UPPERCASE responses (MyMemory quirk when it can't translate)
-            if translated and translated == translated.upper() and not text == text.upper():
-                logger.warning(f"Skipping UPPERCASE response for {langpair}: {translated[:50]}")
-                return None
-
-            return translated if translated else None
-
-    except Exception as e:
-        logger.error(f"Translation error ({langpair}): text_len={len(text)}, error={e}")
+        return await _request(fields, schema, source_lang, target_lang, pair)
+    except Exception:
+        # One language failing must not discard the others, already paid for.
+        logger.exception(f"Translation {pair}: unexpected error")
         return None
 
 
-async def translate_long_text(text: str, source_lang: str, target_lang: str) -> str | None:
-    """
-    Translate long text by splitting into paragraphs/chunks if needed.
-    Handles article bodies that may exceed MyMemory per-request limits.
-    Returns translated text or None on complete failure.
-    """
-    if not text or len(text.strip()) < MIN_TEXT_LENGTH:
+async def _request(fields: dict[str, str], schema: dict, source_lang: str, target_lang: str, pair: str) -> dict[str, str] | None:
+    try:
+        message = await _get_client().messages.create(
+            model=TRANSLATION_MODEL,
+            # Thinking is on by default on Haiku 5.5 and counts toward this ceiling.
+            max_tokens=16000,
+            output_config={
+                # Translation doesn't need deep reasoning; low keeps it fast and cheap.
+                "effort": "low",
+                "format": {"type": "json_schema", "schema": schema},
+            },
+            system=SYSTEM_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Translate from {LANG_NAMES.get(source_lang, source_lang)} into {LANG_NAMES.get(target_lang, target_lang)}.\n\n"
+                    + json.dumps(fields, ensure_ascii=False)
+                ),
+            }],
+        )
+    except anthropic.APIError as e:
+        # The SDK has already retried 429/5xx/connection errors by this point.
+        logger.error(f"Translation {pair} failed: {type(e).__name__}: {e}")
         return None
 
-    # Short text — translate directly
-    if len(text) <= MAX_CHUNK_CHARS:
-        return await translate_text(text, source_lang, target_lang)
-
-    # Split by newlines (paragraphs)
-    paragraphs = text.split('\n')
-    translated_parts = []
-    any_success = False
-
-    for para in paragraphs:
-        stripped = para.strip()
-
-        # Preserve empty lines
-        if not stripped:
-            translated_parts.append('')
-            continue
-
-        # If paragraph is short enough, translate directly
-        if len(stripped) <= MAX_CHUNK_CHARS:
-            translated = await translate_text(stripped, source_lang, target_lang)
-            await asyncio.sleep(API_DELAY_SEC)
-
-            if translated:
-                translated_parts.append(translated)
-                any_success = True
-            else:
-                translated_parts.append(stripped)  # Keep original on failure
-        else:
-            # Very long paragraph — split by sentences (. ! ?)
-            sentences = _split_into_chunks(stripped, MAX_CHUNK_CHARS)
-            translated_sentences = []
-
-            for sentence in sentences:
-                if not sentence.strip():
-                    continue
-                translated = await translate_text(sentence.strip(), source_lang, target_lang)
-                await asyncio.sleep(API_DELAY_SEC)
-
-                if translated:
-                    translated_sentences.append(translated)
-                    any_success = True
-                else:
-                    translated_sentences.append(sentence.strip())
-
-            translated_parts.append(' '.join(translated_sentences))
-
-    if not any_success:
+    # Haiku 5.5 has no server-side refusal fallback, and a cut-off reply is not
+    # valid JSON - either way, skip this language rather than store a partial.
+    if message.stop_reason != "end_turn":
+        logger.error(f"Translation {pair}: stop_reason={message.stop_reason}")
         return None
 
-    return '\n'.join(translated_parts)
+    text = next((b.text for b in message.content if b.type == "text"), None)
+    try:
+        data = json.loads(text or "")
+    except json.JSONDecodeError:
+        logger.error(f"Translation {pair}: reply is not JSON: {(text or '')[:200]}")
+        return None
+    if not isinstance(data, dict):
+        logger.error(f"Translation {pair}: reply is not a JSON object")
+        return None
+
+    result = {name: (data.get(name) or "").strip() for name in fields}
+    if not all(result.values()):
+        logger.warning(f"Translation {pair}: empty field(s) {[k for k, v in result.items() if not v]}")
+        return None
+    return result
 
 
-def _split_into_chunks(text: str, max_chars: int) -> list[str]:
-    """Split text into chunks at sentence boundaries, respecting max_chars limit."""
-    import re
-
-    # Split by sentence-ending punctuation (keep the delimiter)
-    parts = re.split(r'(?<=[.!?])\s+', text)
-    chunks = []
-    current_chunk = ""
-
-    for part in parts:
-        if not part:
-            continue
-        if len(current_chunk) + len(part) + 1 <= max_chars:
-            current_chunk = (current_chunk + " " + part).strip()
-        else:
-            if current_chunk:
-                chunks.append(current_chunk)
-            # If single sentence exceeds limit, just add it anyway
-            current_chunk = part
-
-    if current_chunk:
-        chunks.append(current_chunk)
-
-    return chunks if chunks else [text]
+async def _translate_to_all(fields: dict[str, str], source_lang: str) -> dict[str, dict[str, str]]:
+    """Translate fields into every other app language in parallel."""
+    targets = [lang for lang in ALL_LANGUAGES if lang != source_lang]
+    results = await asyncio.gather(*(_translate_fields(fields, source_lang, lang) for lang in targets))
+    return {lang: r for lang, r in zip(targets, results) if r}
 
 
 async def translate_article(title: str, body: str, source_lang: str) -> dict:
     """
     Translate article title and body to all app languages (except source).
     Returns dict: {"en": {"title": "...", "body": "..."}, "es": {...}, ...}
-    Uses chunked translation for long article bodies.
     """
-    translations = {}
-    target_languages = [lang for lang in ALL_LANGUAGES if lang != source_lang]
+    # The photo credit isn't prose: keep it away from the model and re-attach it
+    # with each language's exact label, so ATTRIBUTION_FOOTER_RE still finds it.
+    match = ATTRIBUTION_FOOTER_RE.search(body or "")
+    text = body[:match.start()] if match else (body or "")
+    if not text.strip():
+        logger.warning("Article has no body text to translate")
+        return {}
 
-    for lang in target_languages:
-        translated_title = await translate_text(title, source_lang, lang)
-        await asyncio.sleep(API_DELAY_SEC)
-
-        # Use chunked translation for body (may be 500-800 words)
-        translated_body = await translate_long_text(body, source_lang, lang)
-        await asyncio.sleep(API_DELAY_SEC)
-
-        if translated_title and translated_body:
-            translations[lang] = {
-                "title": translated_title,
-                "body": translated_body,
-            }
-            logger.info(f"Translated article to {lang}: OK (body_len={len(translated_body)})")
-        else:
-            logger.warning(
-                f"Translation to {lang} incomplete: title={bool(translated_title)}, "
-                f"body={bool(translated_body)}, body_input_len={len(body)}"
-            )
-
+    translations = await _translate_to_all({"title": title, "body": text}, source_lang)
+    for lang, entry in translations.items():
+        if match:
+            footer = re.sub(r"\*(?:Фото|Фота|Photo|Foto):", f"*{ATTRIBUTION_PREFIX[lang]}:",
+                            match.group(0).strip(), count=1)
+            entry["body"] = entry["body"].rstrip() + "\n\n" + footer
+        logger.info(f"Translated article to {lang}: OK (body_len={len(entry['body'])})")
     return translations
 
 
@@ -239,23 +181,16 @@ async def translate_expert(bio: str | None, source_lang: str) -> dict:
     Translate an expert's bio to all app languages.
     Returns dict: {"en": {"bio": "..."}, ...}
 
-    NOTE: the expert's NAME is deliberately NOT machine-translated — these are real
-    people, and MyMemory mangles proper nouns. Names are curated by hand in the admin
-    (transliterated for en/es, left in Cyrillic for uk/be). This helper only fills in
-    the bio; any existing hand-written name stays untouched by the caller.
+    NOTE: the expert's NAME is deliberately NOT machine-translated - these are real
+    people. Names are curated by hand in the admin (transliterated for en/es, left in
+    Cyrillic for uk/be). This helper only fills in the bio; any existing hand-written
+    name stays untouched by the caller.
     """
-    translations = {}
     if not bio:
-        return translations
-
-    target_languages = [lang for lang in ALL_LANGUAGES if lang != source_lang]
-    for lang in target_languages:
-        translated_bio = await translate_long_text(bio, source_lang, lang)
-        await asyncio.sleep(API_DELAY_SEC)
-        if translated_bio:
-            translations[lang] = {"bio": translated_bio}
-            logger.info(f"Translated expert bio to {lang}: OK")
-
+        return {}
+    translations = await _translate_to_all({"bio": bio}, source_lang)
+    for lang in translations:
+        logger.info(f"Translated expert bio to {lang}: OK")
     return translations
 
 
@@ -263,25 +198,11 @@ async def translate_event(title: str, description: str | None, source_lang: str)
     """
     Translate event title and description to all app languages.
     Returns dict: {"en": {"title": "...", "description": "..."}, ...}
-    Uses chunked translation for long descriptions.
     """
-    translations = {}
-    target_languages = [lang for lang in ALL_LANGUAGES if lang != source_lang]
-
-    for lang in target_languages:
-        translated_title = await translate_text(title, source_lang, lang)
-        await asyncio.sleep(API_DELAY_SEC)
-
-        translated_desc = None
-        if description:
-            translated_desc = await translate_long_text(description, source_lang, lang)
-            await asyncio.sleep(API_DELAY_SEC)
-
-        if translated_title:
-            entry = {"title": translated_title}
-            if translated_desc:
-                entry["description"] = translated_desc
-            translations[lang] = entry
-            logger.info(f"Translated event to {lang}: OK")
-
+    fields = {"title": title}
+    if description:
+        fields["description"] = description
+    translations = await _translate_to_all(fields, source_lang)
+    for lang in translations:
+        logger.info(f"Translated event to {lang}: OK")
     return translations

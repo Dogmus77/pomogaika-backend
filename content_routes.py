@@ -15,7 +15,8 @@ import logging
 
 from supabase_client import get_supabase, supabase_query
 from auth import AdminUser, get_current_user, require_admin
-from translation import translate_article, translate_event, translate_expert, check_quota
+from translation import (translate_article, translate_event, translate_expert,
+                         ATTRIBUTION_PREFIX, ATTRIBUTION_FOOTER_RE)
 from push_notifications import notify_new_article, notify_new_event, send_push_async
 
 logger = logging.getLogger(__name__)
@@ -264,7 +265,7 @@ async def translate_expert_endpoint(
     user: AdminUser = Depends(require_admin)
 ):
     """
-    Auto-translate an expert's BIO into the other app languages (MyMemory).
+    Auto-translate an expert's BIO into the other app languages (Claude Haiku).
 
     Names are NOT touched — they're real people, and machine translation mangles proper
     nouns. Curate names by hand via PUT /admin/experts/{id} with a `translations` payload
@@ -280,10 +281,10 @@ async def translate_expert_endpoint(
     if not expert.get("bio"):
         raise HTTPException(status_code=400, detail="Expert has no bio to translate")
 
-    if not await check_quota():
-        raise HTTPException(status_code=429, detail="Translation quota exceeded, try later")
-
     fresh = await translate_expert(expert["bio"], "ru")
+    if not fresh:
+        # Every language failed (bad key, no credit, refusals) - say so instead of "ok".
+        raise HTTPException(status_code=502, detail="Translation failed, see server logs")
 
     # Merge: keep hand-curated names, replace only the bio per language.
     merged = dict(expert.get("translations") or {})
@@ -594,16 +595,7 @@ async def translate_article_manual(
     user: AdminUser = Depends(get_current_user)
 ):
     """Manually trigger translation for an article (async background).
-    Checks quota first, then launches background task.
     """
-    # Quick quota check (fast — single short API call)
-    quota_ok = await check_quota()
-    if not quota_ok:
-        raise HTTPException(
-            status_code=429,
-            detail="Лимит переводов MyMemory исчерпан на сегодня. Попробуйте завтра."
-        )
-
     sb = get_supabase()
     result = sb.table("articles").select("*").eq("id", article_id).execute()
     if not result.data:
@@ -631,8 +623,6 @@ async def translate_article_sync_test(
     user: AdminUser = Depends(get_current_user)
 ):
     """DEBUG: Run translation synchronously and return detailed diagnostics."""
-    import httpx
-
     sb = get_supabase()
     result = sb.table("articles").select("*").eq("id", article_id).execute()
     if not result.data:
@@ -646,30 +636,7 @@ async def translate_article_sync_test(
         "body_len": len(article["body"]),
     }
 
-    # Step 1: Test raw MyMemory API call with a simple short text
-    test_text = "Привет мир"
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(
-                "https://api.mymemory.translated.net/get",
-                data={
-                    "q": test_text,
-                    "langpair": "ru-RU|en-GB",
-                    "de": "pomogaika.app@gmail.com",
-                }
-            )
-            raw = resp.json()
-            diagnostics["mymemory_test"] = {
-                "status_code": resp.status_code,
-                "response_status": raw.get("responseStatus"),
-                "translated": raw.get("responseData", {}).get("translatedText", ""),
-                "quota_finished": raw.get("quotaFinished", False),
-                "raw_keys": list(raw.keys()),
-            }
-    except Exception as e:
-        diagnostics["mymemory_test"] = {"error": str(e)}
-
-    # Step 2: Try full translation
+    # Full translation, synchronously, so errors come back in the response
     try:
         translations = await translate_article(article["title"], article["body"], article["language"])
         diagnostics["full_translate"] = {
@@ -777,27 +744,13 @@ def _fetch_stock_image(query: str) -> Optional[dict]:
         return None
 
 
-# Localized prefix for the photo-attribution footer line.
-_ATTRIBUTION_PREFIX = {
-    "ru": "Фото",
-    "uk": "Фото",
-    "be": "Фота",
-    "en": "Photo",
-    "es": "Foto",
-}
-
-# Matches our attribution footer added at the end of body in any language we support.
-# Format: `\n\n---\n\n*Фото: [Name](url) / [Pexels](url)*` (with localized prefix).
-# The regex keys off the localized prefix, so it matches regardless of source name.
-_ATTRIBUTION_FOOTER_RE = __import__("re").compile(
-    r"\s*\n\n---\n\n\*(?:Фото|Фота|Photo|Foto):.*?\*\s*$",
-    __import__("re").DOTALL,
-)
+# Footer label + regex live in translation.py (ATTRIBUTION_PREFIX / ATTRIBUTION_FOOTER_RE):
+# the translator re-attaches the footer per language and must use the same copy.
 
 
 def _attribution_footer(image: dict, lang: str) -> str:
     """Build the markdown footer line crediting the photographer + source."""
-    prefix = _ATTRIBUTION_PREFIX.get(lang, "Photo")
+    prefix = ATTRIBUTION_PREFIX.get(lang, "Photo")
     return (
         f"\n\n---\n\n*{prefix}: "
         f"[{image['photographer_name']}]({image['photographer_url']}) "
@@ -809,7 +762,7 @@ def _strip_attribution_footer(body: str) -> str:
     """Remove our attribution footer if it's at the end of body. Idempotent."""
     if not body:
         return body
-    return _ATTRIBUTION_FOOTER_RE.sub("", body).rstrip()
+    return ATTRIBUTION_FOOTER_RE.sub("", body).rstrip()
 
 
 # Known wine grapes + regions used to extract a focused Pexels search query.
@@ -1246,16 +1199,7 @@ async def translate_event_manual(
     user: AdminUser = Depends(get_current_user)
 ):
     """Manually trigger translation for an event (async background).
-    Checks quota first, then launches background task.
     """
-    # Quick quota check
-    quota_ok = await check_quota()
-    if not quota_ok:
-        raise HTTPException(
-            status_code=429,
-            detail="Лимит переводов MyMemory исчерпан на сегодня. Попробуйте завтра."
-        )
-
     sb = get_supabase()
     result = sb.table("events").select("*").eq("id", event_id).execute()
     if not result.data:
