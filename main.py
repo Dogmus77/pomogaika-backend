@@ -4,6 +4,7 @@ Production-ready backend with real store data
 """
 
 import logging
+import re
 
 # Without this the root logger has no handler, Python's last-resort handler prints
 # WARNING and above only, and every logger.info() in the backend never reached
@@ -170,9 +171,14 @@ def fetch_wines_sync(postal_code: str = "46001") -> list[ParserWine]:
         # D.O. Granada wines say "Granada".
         "granadas",
     ]
+    # Drinks shelved next to wine, matched as whole words: DIA returns cider for "cava"
+    # (it showed up first under party -> sparkling), and grape must and an alcohol-free
+    # "tinto" soft drink came back as red wine.
+    _EXCLUDE_WORDS = re.compile(r"\b(sidra|cider|mosto|bebida)\b", re.IGNORECASE)
     all_wines = [
         w for w in all_wines
         if not any(kw in w.name.lower() for kw in _EXCLUDE_KEYWORDS)
+        and not _EXCLUDE_WORDS.search(w.name)
     ]
     
     # 5. One entry per product id: the per-type queries overlap (the same bottle came

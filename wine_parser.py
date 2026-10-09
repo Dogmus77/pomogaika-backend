@@ -3,6 +3,7 @@ Wine Parser PoC - Consum & Mercadona
 Fetching wine data from Spanish supermarkets
 """
 
+import re
 import requests
 import json
 from dataclasses import dataclass, asdict
@@ -459,6 +460,11 @@ class MercadonaParser:
         return None
 
 
+# Masymas categories that hold wine: "Vino tinto de mesa", "D.O. Rioja", "Otras D.O.",
+# "Cava brut", "Otros espumosos", "Vinos finos y dulces"...
+_MASYMAS_WINE_CATEGORY = re.compile(r"vino|cava|espumos|champ|d\.\s?o\b|denominaci|generos|jerez|lambrusco", re.IGNORECASE)
+
+
 class MasymasParser:
     """
     Parser for tienda.masymas.com
@@ -602,9 +608,16 @@ class MasymasParser:
             
             image_url = product_data.get("imageURL", "")
             
+            # Masymas full-text search matches any word of the query: "vino ecologico" also
+            # brings organic eggs, oat drinks, baby food and beef, which then landed in the
+            # catalogue as red wine. Trust the product's category; keep products without one.
+            categories = item.get("categories", [])
+            cat_names = [c.get("name", "") for c in categories if isinstance(c, dict)]
+            if cat_names and not any(_MASYMAS_WINE_CATEGORY.search(c) for c in cat_names):
+                return None
+
             # Region from categories
             region = None
-            categories = item.get("categories", [])
             for cat in categories:
                 cat_name = cat.get("name", "") if isinstance(cat, dict) else ""
                 if "D.O." in cat_name or "D.o." in cat_name:
