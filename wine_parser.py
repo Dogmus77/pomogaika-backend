@@ -462,7 +462,7 @@ class MercadonaParser:
 
 # Masymas categories that hold wine: "Vino tinto de mesa", "D.O. Rioja", "Otras D.O.",
 # "Cava brut", "Otros espumosos", "Vinos finos y dulces"...
-_MASYMAS_WINE_CATEGORY = re.compile(r"vino|cava|espumos|champ|d\.\s?o\b|denominaci|generos|jerez|lambrusco", re.IGNORECASE)
+_MASYMAS_WINE_CATEGORY = re.compile(r"vino|cava|espumos|champ[aá]n|champagne|d\.\s?o\b|denominaci|generos|jerez|lambrusco", re.IGNORECASE)
 
 
 class MasymasParser:
