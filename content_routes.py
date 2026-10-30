@@ -938,7 +938,7 @@ async def _generate_article_task(api_key: str):
             {"betas": ["server-side-fallback-2026-07-01"], "fallbacks": "default"}
             if model == ARTICLE_MODEL_DEFAULT else {}
         )
-        message = await client.beta.messages.create(
+        request = dict(
             model=model,
             # Thinking is on by default on 5.x models and counts toward this
             # ceiling, and their tokenizer counts Cyrillic ~30% longer than 4.x.
@@ -968,14 +968,27 @@ BODY:
             }]
         )
 
-        # A truncated or declined reply must not be saved as a draft.
-        if message.stop_reason != "end_turn":
-            logger.error(f"Generate article: model={message.model} stop_reason={message.stop_reason} — nothing saved")
-            return
+        for attempt in (1, 2):
+            message = await client.beta.messages.create(**request)
 
-        # Read text blocks by type: on 5.x models the reply opens with a thinking
-        # block (and may carry a fallback marker), so content[0] is not the text.
-        response_text = "".join(b.text for b in message.content if b.type == "text").strip()
+            # A truncated or declined reply must not be saved as a draft.
+            if message.stop_reason != "end_turn":
+                logger.error(f"Generate article: model={message.model} stop_reason={message.stop_reason} — nothing saved")
+                return
+
+            # Read text blocks by type: on 5.x models the reply opens with a thinking
+            # block (and may carry a fallback marker), so content[0] is not the text.
+            response_text = "".join(b.text for b in message.content if b.type == "text").strip()
+
+            # Now and then the model writes a Cyrillic letter as bytes that don't make
+            # valid UTF-8, and the API returns U+FFFD in its place (2026-10-29 draft:
+            # "ол\ufffd\ufffdросо"). Nothing downstream can tell which letter it was, so ask again.
+            if "\ufffd" not in response_text:
+                break
+            if attempt == 1:
+                logger.warning("Generate article: reply has broken characters (U+FFFD), asking again")
+            else:
+                logger.error("Generate article: second reply also has U+FFFD; saving the draft for review anyway")
 
         # Parse response
         title = ""

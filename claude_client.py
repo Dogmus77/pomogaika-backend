@@ -34,25 +34,36 @@ async def structured_json(*, system: str, user: str, schema: dict, label: str,
     options = {k: v for k, v in (("timeout", timeout), ("max_retries", max_retries)) if v is not None}
     if options:
         client = client.with_options(**options)
-    try:
-        message = await client.messages.create(
-            model=model,
-            # Thinking is on by default on 5.x models and counts toward this ceiling.
-            max_tokens=max_tokens,
-            output_config={"effort": effort, "format": {"type": "json_schema", "schema": schema}},
-            system=system,
-            messages=[{"role": "user", "content": user}],
-        )
-    except anthropic.APIError as e:
-        # The SDK has already retried 429/5xx/connection errors by this point.
-        logger.error(f"{label}: {type(e).__name__}: {e}")
-        return None
+    for attempt in (1, 2):
+        try:
+            message = await client.messages.create(
+                model=model,
+                # Thinking is on by default on 5.x models and counts toward this ceiling.
+                max_tokens=max_tokens,
+                output_config={"effort": effort, "format": {"type": "json_schema", "schema": schema}},
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            )
+        except anthropic.APIError as e:
+            # The SDK has already retried 429/5xx/connection errors by this point.
+            logger.error(f"{label}: {type(e).__name__}: {e}")
+            return None
 
-    # Haiku 5.5 has no server-side refusal fallback, and a cut-off reply isn't valid JSON.
-    if message.stop_reason != "end_turn":
-        logger.error(f"{label}: stop_reason={message.stop_reason}")
-        return None
-    text = next((b.text for b in message.content if b.type == "text"), None)
+        # Haiku 5.5 has no server-side refusal fallback, and a cut-off reply isn't valid JSON.
+        if message.stop_reason != "end_turn":
+            logger.error(f"{label}: stop_reason={message.stop_reason}")
+            return None
+        text = next((b.text for b in message.content if b.type == "text"), None)
+
+        # Rarely the model emits a non-Latin letter as bytes that aren't valid UTF-8 and
+        # the API returns U+FFFD instead ("ол\ufffd\ufffdросо"). That would end up in a
+        # translation or in the week-long pairings cache, so ask once more.
+        if not text or "\ufffd" not in text:
+            break
+        if attempt == 1:
+            logger.warning(f"{label}: reply has broken characters (U+FFFD), asking again")
+        else:
+            logger.error(f"{label}: second reply also has U+FFFD; using it")
     try:
         data = json.loads(text or "")
     except json.JSONDecodeError:
